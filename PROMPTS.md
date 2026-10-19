@@ -57,3 +57,7 @@ I am still learning development and AWS CloudOps. Explain important commands and
 5. **Resource-Based Zero-Trust Authorization Requirement:**
    - *Issue:* Standard role-based access control (RBAC) often allows `Admin` to access everything. The prompt strictly mandated: *"An Admin must not automatically receive permission to read every document."*
    - *Resolution:* Designed and implemented `DocumentAuthorizationHandler` utilizing ASP.NET Core's resource-based authorization system (`IAuthorizationHandler<OperationAuthorizationRequirement, Document>`). The handler verifies explicit document ownership (`OwnerId == currentUserId`) or an active `DocumentPermission` record (`Read`/`Edit`). If an Admin attempts to read a document without ownership or permission, the check fails (emitting a 403 Forbidden and logging an audit warning). Built 19 automated tests (including test `Admin_Without_Explicit_Permission_Must_NOT_Automatically_Receive_Read_Access`) to mathematically prove this invariant.
+
+6. **GitHub Remote Publishing:**
+   - *Remote Configured:* `https://github.com/nagabhyruchiranjeevi/TrustVault.git`
+   - *Action:* Remote added and `main` branch pushed successfully to GitHub with all Day 1 commits.
