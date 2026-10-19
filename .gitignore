@@ -1,0 +1,53 @@
+# Build and Object Folders
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# .NET User Secrets and Cache
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Secrets and Environment Variables
+.env
+.env.*
+!.env.example
+appsettings.Production.json
+appsettings.Local.json
+*.pfx
+*.pem
+*.key
+*.cert
+secrets.json
+
+# Node.js and Frontend
+node_modules/
+dist/
+build/
+coverage/
+.npm
+*.tsbuildinfo
+.eslintcache
+
+# Database / Local storage
+database/data/
+uploads/
+storage/temp/
+
+# OS Generated Files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Test Results
+TestResults/
+*.trx
+*.coverage
+*.opencover.xml

@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "backend", "backend", "{1F5052D1-3AFC-4878-95CE-1FD6F402C000}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TrustVault.Api", "backend\TrustVault.Api\TrustVault.Api.csproj", "{449F62E1-C9E5-464B-A1DF-DE75C0F9F747}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{66D24161-D2E7-480C-90C8-EF0A034C6116}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TrustVault.Tests", "tests\TrustVault.Tests\TrustVault.Tests.csproj", "{EE79A956-6DC3-4554-9D1D-477469DEDE85}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{449F62E1-C9E5-464B-A1DF-DE75C0F9F747}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{449F62E1-C9E5-464B-A1DF-DE75C0F9F747}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{449F62E1-C9E5-464B-A1DF-DE75C0F9F747}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{449F62E1-C9E5-464B-A1DF-DE75C0F9F747}.Release|Any CPU.Build.0 = Release|Any CPU
+		{EE79A956-6DC3-4554-9D1D-477469DEDE85}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EE79A956-6DC3-4554-9D1D-477469DEDE85}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EE79A956-6DC3-4554-9D1D-477469DEDE85}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EE79A956-6DC3-4554-9D1D-477469DEDE85}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{449F62E1-C9E5-464B-A1DF-DE75C0F9F747} = {1F5052D1-3AFC-4878-95CE-1FD6F402C000}
+		{EE79A956-6DC3-4554-9D1D-477469DEDE85} = {66D24161-D2E7-480C-90C8-EF0A034C6116}
+	EndGlobalSection
+EndGlobal
