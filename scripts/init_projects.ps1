@@ -1,5 +1,4 @@
 $dotnet = "C:\Users\HP\AppData\Local\Microsoft\dotnet\dotnet.exe"
-$git = "C:\Users\HP\AppData\Local\Programs\Git\cmd\git.exe"
 
 Write-Host "Creating Solution and .NET Projects..."
 Set-Location "e:\TrustVault"
