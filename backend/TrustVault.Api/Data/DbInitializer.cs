@@ -15,15 +15,16 @@ public static class DbInitializer
 
         try
         {
-            // Apply migrations or ensure database is created
-            if (context.Database.IsRelational())
+            // Apply migrations for PostgreSQL or ensure schema is created for SQLite/InMemory
+            if (context.Database.ProviderName == "Npgsql.EntityFrameworkCore.PostgreSQL")
             {
                 await context.Database.MigrateAsync();
-                logger.LogInformation("Database migrations applied successfully.");
+                logger.LogInformation("PostgreSQL database migrations applied successfully.");
             }
             else
             {
                 await context.Database.EnsureCreatedAsync();
+                logger.LogInformation("Database created via schema generation ({Provider}).", context.Database.ProviderName);
             }
 
             // Seed Roles

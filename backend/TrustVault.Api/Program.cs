@@ -15,13 +15,23 @@ using TrustVault.Api.Validators;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Database & EF Core setup
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
+// 1. Database & EF Core setup (Supports PostgreSQL for production/staging and SQLite for local development)
+var databaseProvider = builder.Configuration["DatabaseProvider"] ?? "Sqlite";
+var pgConnectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
     ?? "Host=localhost;Port=5432;Database=trustvault_db;Username=postgres;Password=postgres;";
+var sqliteConnectionString = builder.Configuration.GetConnectionString("SqliteConnection") 
+    ?? "Data Source=trustvault.db";
 
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
 {
-    options.UseNpgsql(connectionString);
+    if (databaseProvider.Equals("PostgreSQL", StringComparison.OrdinalIgnoreCase))
+    {
+        options.UseNpgsql(pgConnectionString);
+    }
+    else
+    {
+        options.UseSqlite(sqliteConnectionString);
+    }
 });
 
 // 2. ASP.NET Core Identity configuration
