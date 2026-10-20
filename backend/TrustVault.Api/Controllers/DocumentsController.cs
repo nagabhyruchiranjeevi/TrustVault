@@ -319,38 +319,40 @@ public class DocumentsController : ControllerBase
 
         return Ok(new { Message = "Document updated successfully." });
     }
-        /// <summary>
-        /// Edits document metadata (currently only Title). Requires DocumentOperations.Edit.
-        /// </summary>
-        [HttpPatch("{id:guid}/metadata")]
-        public async Task<IActionResult> EditMetadata(Guid id, [FromBody] UpdateDocumentDto dto)
+
+    /// <summary>
+    /// Edits document metadata (title). Requires DocumentOperations.Edit.
+    /// Viewers cannot edit. Both owners and users with Edit permission may update.
+    /// </summary>
+    [HttpPatch("{id:guid}/metadata")]
+    public async Task<IActionResult> EditMetadata(Guid id, [FromBody] UpdateDocumentDto dto)
+    {
+        var validation = await _updateValidator.ValidateAsync(dto);
+        if (!validation.IsValid)
+            throw new ValidationException(validation.Errors);
+
+        var document = await _dbContext.Documents.FirstOrDefaultAsync(d => d.Id == id && !d.IsDeleted);
+        if (document == null)
+            return NotFound(new { Message = "Document not found." });
+
+        var authResult = await _authorizationService.AuthorizeAsync(User, document, DocumentOperations.Edit);
+        if (!authResult.Succeeded)
         {
-            var validation = await _updateValidator.ValidateAsync(dto);
-            if (!validation.IsValid)
-                throw new ValidationException(validation.Errors);
-
-            var document = await _dbContext.Documents.FirstOrDefaultAsync(d => d.Id == id && !d.IsDeleted);
-            if (document == null)
-                return NotFound(new { Message = "Document not found." });
-
-            var authResult = await _authorizationService.AuthorizeAsync(User, document, DocumentOperations.Edit);
-            if (!authResult.Succeeded)
-            {
-                await _auditService.LogEventAsync(CurrentUserId, "EditMetadataDenied", "Document", id.ToString(),
-                    "Edit permission denied", "Forbidden", ClientIp, CorrelationId);
-                return Forbid();
-            }
-
-            var oldTitle = document.Title;
-            document.Title = dto.Title.Trim();
-            document.UpdatedAtUtc = DateTime.UtcNow;
-
-            await _dbContext.SaveChangesAsync();
-            await _auditService.LogEventAsync(CurrentUserId, "EditMetadata", "Document", id.ToString(),
-                $"Metadata updated: title from '{oldTitle}' to '{document.Title}'", "Success", ClientIp, CorrelationId);
-
-            return Ok(new { Message = "Document metadata updated successfully." });
+            await _auditService.LogEventAsync(CurrentUserId, "EditMetadataDenied", "Document", id.ToString(),
+                "Edit permission denied", "Forbidden", ClientIp, CorrelationId);
+            return Forbid();
         }
+
+        var oldTitle = document.Title;
+        document.Title = dto.Title.Trim();
+        document.UpdatedAtUtc = DateTime.UtcNow;
+
+        await _dbContext.SaveChangesAsync();
+        await _auditService.LogEventAsync(CurrentUserId, "EditMetadata", "Document", id.ToString(),
+            $"Metadata updated: title from '{oldTitle}' to '{document.Title}'", "Success", ClientIp, CorrelationId);
+
+        return Ok(new { Message = "Document metadata updated successfully." });
+    }
 
 
     /// <summary>
@@ -377,6 +379,16 @@ public class DocumentsController : ControllerBase
         document.UpdatedAtUtc = DateTime.UtcNow;
 
         await _dbContext.SaveChangesAsync();
+
+        // Best-effort binary cleanup — soft-delete first so record is preserved for audit.
+        // We intentionally do NOT await a crash here: if storage delete fails, the record is
+        // already soft-deleted and the binary becomes inaccessible through the API.
+        _ = Task.Run(async () =>
+        {
+            try { await _storageService.DeleteDocumentAsync(document.StorageKey); }
+            catch (Exception) { /* storage cleanup failures are non-fatal */ }
+        });
+
         await _auditService.LogEventAsync(CurrentUserId, "DeleteDocument", "Document", id.ToString(),
             $"Document '{document.Title}' ({document.FileName}) soft-deleted", "Success", ClientIp, CorrelationId);
 

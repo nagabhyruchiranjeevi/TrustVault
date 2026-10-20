@@ -38,6 +38,8 @@ coverage/
 database/data/
 uploads/
 storage/temp/
+*.db           # SQLite dev databases — never commit real data
+SecureVaultStorage/   # Local file vault — never commit stored documents
 
 # OS Generated Files
 Thumbs.db
