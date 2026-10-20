@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using TrustVault.Api.Data;
 using TrustVault.Api.DTOs;
 using TrustVault.Api.Models;
+using TrustVault.Api.Services;
 
 namespace TrustVault.Api.Controllers;
 
@@ -13,10 +14,12 @@ namespace TrustVault.Api.Controllers;
 public class AuditController : ControllerBase
 {
     private readonly ApplicationDbContext _dbContext;
+    private readonly IAuditService _auditService;
 
-    public AuditController(ApplicationDbContext dbContext)
+    public AuditController(ApplicationDbContext dbContext, IAuditService auditService)
     {
         _dbContext = dbContext;
+        _auditService = auditService;
     }
 
     [HttpGet]
@@ -27,10 +30,11 @@ public class AuditController : ControllerBase
         var logs = await _dbContext.AuditEvents
             .AsNoTracking()
             .Include(a => a.User)
-            .OrderByDescending(a => a.TimestampUtc)
+            .OrderByDescending(a => a.SequenceNumber)
             .Take(cappedLimit)
             .Select(a => new AuditEventDto(
                 a.Id,
+                a.SequenceNumber,
                 a.UserId,
                 a.User != null ? a.User.Email : null,
                 a.Action,
@@ -38,11 +42,34 @@ public class AuditController : ControllerBase
                 a.EntityId,
                 a.TimestampUtc,
                 a.IpAddress,
+                a.CorrelationId,
                 a.Details,
-                a.Status
+                a.Status,
+                a.PreviousHash,
+                a.CurrentHash
             ))
             .ToListAsync();
 
         return Ok(logs);
+    }
+
+    [HttpGet("verify")]
+    public async Task<IActionResult> VerifyIntegrity()
+    {
+        var (isValid, violation, count) = await _auditService.VerifyChainIntegrityAsync();
+
+        var result = new AuditVerificationResultDto(
+            isValid,
+            count,
+            violation,
+            DateTime.UtcNow
+        );
+
+        if (!isValid)
+        {
+            return StatusCode(StatusCodes.Status409Conflict, result);
+        }
+
+        return Ok(result);
     }
 }

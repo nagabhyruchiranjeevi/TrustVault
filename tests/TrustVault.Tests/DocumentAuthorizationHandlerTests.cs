@@ -189,4 +189,47 @@ public class DocumentAuthorizationHandlerTests
         readContext.HasSucceeded.Should().BeTrue("user with Edit permission can Read");
         editContext.HasSucceeded.Should().BeTrue("user with Edit permission can Edit");
     }
-}
+        [Fact]
+        public async Task RevokedPermission_Should_Not_Authorize_Read()
+        {
+            // Arrange - create user, document, grant permission, then revoke
+            var ownerId = Guid.NewGuid();
+            var viewerId = Guid.NewGuid();
+            var principal = CreatePrincipal(viewerId, "viewer@trustvault.local", Roles.Viewer);
+
+            var document = new Document
+            {
+                Id = Guid.NewGuid(),
+                Title = "Secret Doc",
+                OwnerId = ownerId
+            };
+
+            var permission = new DocumentPermission
+            {
+                Id = Guid.NewGuid(),
+                DocumentId = document.Id,
+                UserId = viewerId,
+                PermissionLevel = PermissionLevel.Read,
+                GrantedById = ownerId
+            };
+
+            _dbContext.Documents.Add(document);
+            _dbContext.DocumentPermissions.Add(permission);
+            await _dbContext.SaveChangesAsync();
+
+            // Verify initially authorized
+            var initialContext = new AuthorizationHandlerContext([DocumentOperations.Read], principal, document);
+            await _handler.HandleAsync(initialContext);
+            initialContext.HasSucceeded.Should().BeTrue("permission granted should allow read");
+
+            // Revoke permission (simulate revocation)
+            _dbContext.DocumentPermissions.Remove(permission);
+            await _dbContext.SaveChangesAsync();
+
+            // New context after revocation
+            var afterRevokeContext = new AuthorizationHandlerContext([DocumentOperations.Read], principal, document);
+            await _handler.HandleAsync(afterRevokeContext);
+            afterRevokeContext.HasSucceeded.Should().BeFalse("revoked permission must deny read immediately");
+        }
+        }
+

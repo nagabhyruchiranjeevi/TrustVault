@@ -4,6 +4,21 @@ using TrustVault.Api.Models;
 
 namespace TrustVault.Api.Validators;
 
+public static class SecurityConstants
+{
+    public const long MaxFileSizeBytes = 15 * 1024 * 1024; // 15 Megabytes
+
+    public static readonly HashSet<string> PermittedExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".pdf", ".png", ".jpg", ".jpeg", ".txt", ".docx", ".xlsx", ".csv", ".json", ".xml"
+    };
+
+    public static readonly HashSet<string> BlockedExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".exe", ".dll", ".bat", ".cmd", ".sh", ".ps1", ".vbs", ".js", ".msi", ".jar", ".scr", ".pif"
+    };
+}
+
 public class RegisterRequestValidator : AbstractValidator<RegisterRequest>
 {
     public RegisterRequestValidator()
@@ -25,7 +40,6 @@ public class RegisterRequestValidator : AbstractValidator<RegisterRequest>
             .Matches(@"[0-9]").WithMessage("Password must contain at least one number.")
             .Matches(@"[\!\?\*\@\#\$\%\^\&\+\=]").WithMessage("Password must contain at least one special character.");
 
-        // Security rule: Admin cannot be self-assigned through public registration
         RuleFor(x => x.Role)
             .Must(role => string.IsNullOrEmpty(role) || role == Roles.Owner || role == Roles.Viewer)
             .WithMessage("Invalid role selection. Admin roles cannot be self-assigned.");
@@ -51,16 +65,46 @@ public class CreateDocumentValidator : AbstractValidator<CreateDocumentDto>
     {
         RuleFor(x => x.Title)
             .NotEmpty().WithMessage("Document title is required.")
-            .MaximumLength(255);
+            .MaximumLength(255).WithMessage("Title cannot exceed 255 characters.");
 
         RuleFor(x => x.FileName)
             .NotEmpty().WithMessage("File name is required.")
-            .MaximumLength(255)
+            .MaximumLength(255).WithMessage("File name cannot exceed 255 characters.")
             .Must(fn => !fn.Contains("..") && !fn.Contains('/') && !fn.Contains('\\'))
-            .WithMessage("File name contains invalid or path-traversal characters.");
+            .WithMessage("File name contains invalid or path-traversal characters.")
+            .Must(fn =>
+            {
+                var ext = Path.GetExtension(fn);
+                return !string.IsNullOrEmpty(ext) && SecurityConstants.PermittedExtensions.Contains(ext);
+            })
+            .WithMessage("File extension is not permitted. Allowed types: PDF, PNG, JPG, TXT, DOCX, XLSX, CSV, JSON, XML.")
+            .Must(fn =>
+            {
+                var ext = Path.GetExtension(fn);
+                return string.IsNullOrEmpty(ext) || !SecurityConstants.BlockedExtensions.Contains(ext);
+            })
+            .WithMessage("Executable and script files are strictly prohibited.");
 
         RuleFor(x => x.Base64Content)
-            .NotEmpty().WithMessage("Document content is required.");
+            .NotEmpty().WithMessage("Document content is required.")
+            .Must(base64 =>
+            {
+                if (string.IsNullOrEmpty(base64)) return false;
+                // Approximate base64 decoded size: (length * 3 / 4)
+                var approximateSize = (base64.Length * 3) / 4;
+                return approximateSize <= SecurityConstants.MaxFileSizeBytes;
+            })
+            .WithMessage($"Document payload exceeds the maximum allowed size of {SecurityConstants.MaxFileSizeBytes / (1024 * 1024)}MB.");
+    }
+}
+
+public class UpdateDocumentValidator : AbstractValidator<UpdateDocumentDto>
+{
+    public UpdateDocumentValidator()
+    {
+        RuleFor(x => x.Title)
+            .NotEmpty().WithMessage("Document title is required.")
+            .MaximumLength(255).WithMessage("Document title cannot exceed 255 characters.");
     }
 }
 

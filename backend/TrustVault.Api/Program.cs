@@ -89,7 +89,18 @@ builder.Services.AddScoped<IAuthorizationHandler, DocumentAuthorizationHandler>(
 // 5. Application Services & Validators
 builder.Services.AddScoped<ITokenService, TokenService>();
 builder.Services.AddScoped<IAuditService, AuditService>();
-builder.Services.AddScoped<IDocumentStorageService, LocalSecureFileStorageService>();
+
+var storageProvider = builder.Configuration["Storage:Provider"] ?? "Local";
+if (storageProvider.Equals("S3", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<Amazon.S3.IAmazonS3, Amazon.S3.AmazonS3Client>();
+    builder.Services.AddScoped<IDocumentStorageService, S3DocumentStorageService>();
+}
+else
+{
+    builder.Services.AddScoped<IDocumentStorageService, LocalSecureFileStorageService>();
+}
+
 builder.Services.AddScoped<IAuthService, AuthService>();
 
 builder.Services.AddValidatorsFromAssemblyContaining<RegisterRequestValidator>();

@@ -83,7 +83,10 @@ public class ApplicationDbContext : IdentityDbContext<ApplicationUser, IdentityR
             b.Property(a => a.EntityType).HasMaxLength(100).IsRequired();
             b.Property(a => a.EntityId).HasMaxLength(100);
             b.Property(a => a.IpAddress).HasMaxLength(50);
+            b.Property(a => a.CorrelationId).HasMaxLength(100);
             b.Property(a => a.Status).HasMaxLength(50).IsRequired();
+            b.Property(a => a.PreviousHash).HasMaxLength(64).IsRequired();
+            b.Property(a => a.CurrentHash).HasMaxLength(64).IsRequired();
 
             b.HasOne(a => a.User)
                 .WithMany()
@@ -91,6 +94,7 @@ public class ApplicationDbContext : IdentityDbContext<ApplicationUser, IdentityR
                 .OnDelete(DeleteBehavior.SetNull);
 
             b.HasIndex(a => a.TimestampUtc);
+            b.HasIndex(a => a.SequenceNumber).IsUnique();
             b.HasIndex(a => a.UserId);
             b.HasIndex(a => a.Action);
         });
