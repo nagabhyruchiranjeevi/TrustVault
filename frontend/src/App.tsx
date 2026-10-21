@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from './api/client';
-import type { User, DocumentItem, HealthCheckResponse, AuditEventItem } from './types';
+import type { User, DocumentItem, HealthCheckResponse, AuditEventItem, DocumentPermissionItem, AuditVerificationResult } from './types';
 
 export const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -16,9 +16,18 @@ export const App: React.FC = () => {
 
   // Document states
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
   const [auditLogs, setAuditLogs] = useState<AuditEventItem[]>([]);
+  const [auditVerification, setAuditVerification] = useState<AuditVerificationResult | null>(null);
   const [uploadTitle, setUploadTitle] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  // Permission Modal states
+  const [permissionModalDoc, setPermissionModalDoc] = useState<DocumentItem | null>(null);
+  const [activePermissions, setActivePermissions] = useState<DocumentPermissionItem[]>([]);
+  const [grantTargetEmail, setGrantTargetEmail] = useState('');
+  const [grantPermissionLevel, setGrantPermissionLevel] = useState<'Read' | 'Edit'>('Read');
+  const [permissionLoading, setPermissionLoading] = useState(false);
 
   // Status states
   const [loading, setLoading] = useState<boolean>(false);
@@ -33,12 +42,12 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  // Fetch data when activeTab changes
+  // Fetch data when activeTab or user changes
   useEffect(() => {
     if (currentUser) {
       if (activeTab === 'documents') {
         fetchDocuments();
-      } else if (activeTab === 'audit' && currentUser.roles.includes('Admin')) {
+      } else if (activeTab === 'audit') {
         fetchAuditLogs();
       }
     }
@@ -58,7 +67,7 @@ export const App: React.FC = () => {
     try {
       const user = await api.getMe();
       setCurrentUser(user);
-    } catch (err: any) {
+    } catch {
       api.logout();
       setCurrentUser(null);
     } finally {
@@ -69,6 +78,26 @@ export const App: React.FC = () => {
   const fetchDocuments = async () => {
     setLoading(true);
     setError(null);
+    try {
+      const docs = searchQuery.trim()
+        ? await api.searchDocuments(searchQuery.trim())
+        : await api.getDocuments();
+      setDocuments(docs);
+    } catch (err: any) {
+      setError(err.message || 'Failed to load documents');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSearchSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    fetchDocuments();
+  };
+
+  const handleClearSearch = async () => {
+    setSearchQuery('');
+    setLoading(true);
     try {
       const docs = await api.getDocuments();
       setDocuments(docs);
@@ -83,10 +112,29 @@ export const App: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const logs = await api.getAuditLogs();
-      setAuditLogs(logs);
+      if (currentUser?.roles.includes('Admin')) {
+        const logs = await api.getAuditLogs();
+        setAuditLogs(logs);
+      } else {
+        const logs = await api.getMyAuditLogs();
+        setAuditLogs(logs);
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to load audit logs');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifyAuditChain = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await api.verifyAuditIntegrity();
+      setAuditVerification(res);
+      setSuccessMsg(`Hash chain integrity verified! Checked ${res.totalEventsVerified} events from Genesis.`);
+    } catch (err: any) {
+      setError(`Audit Integrity Check Failed: ${err.message}`);
     } finally {
       setLoading(false);
     }
@@ -102,11 +150,11 @@ export const App: React.FC = () => {
       if (authMode === 'login') {
         const res = await api.login(email, password);
         setCurrentUser(res.user);
-        setSuccessMsg('Welcome back!');
+        setSuccessMsg(`Authenticated as ${res.user.email} (${res.user.roles.join(', ')})`);
       } else {
         const res = await api.register(email, password, fullName, role);
         setCurrentUser(res.user);
-        setSuccessMsg('Account created successfully!');
+        setSuccessMsg(`Account created and signed in as ${res.user.email}`);
       }
     } catch (err: any) {
       setError(err.message || 'Authentication failed');
@@ -120,6 +168,8 @@ export const App: React.FC = () => {
     setCurrentUser(null);
     setDocuments([]);
     setAuditLogs([]);
+    setAuditVerification(null);
+    setPermissionModalDoc(null);
     setSuccessMsg(null);
     setError(null);
   };
@@ -146,10 +196,11 @@ export const App: React.FC = () => {
             selectedFile.type || 'application/octet-stream',
             base64Content
           );
-          setSuccessMsg(`Document "${uploadTitle}" safely vaulted!`);
+          setSuccessMsg(`Document "${uploadTitle}" safely vaulted with encrypted storage key!`);
           setUploadTitle('');
           setSelectedFile(null);
           setActiveTab('documents');
+          fetchDocuments();
         } catch (uploadErr: any) {
           setError(uploadErr.message || 'Failed to save document');
         } finally {
@@ -157,17 +208,85 @@ export const App: React.FC = () => {
         }
       };
       reader.readAsDataURL(selectedFile);
-    } catch (err: any) {
+    } catch {
       setError('Error reading file data');
       setLoading(false);
     }
   };
 
   const handleDownload = async (doc: DocumentItem) => {
+    setError(null);
     try {
       await api.downloadDocument(doc.id, doc.fileName);
+      setSuccessMsg(`Downloaded '${doc.fileName}' successfully.`);
     } catch (err: any) {
-      setError(`Failed to download ${doc.fileName}: ${err.message}`);
+      setError(`Download Denied: ${err.message}`);
+    }
+  };
+
+  const handleDelete = async (doc: DocumentItem) => {
+    if (!window.confirm(`Are you sure you want to delete "${doc.title}"? It will be soft-deleted immediately.`)) {
+      return;
+    }
+    setError(null);
+    try {
+      await api.deleteDocument(doc.id);
+      setSuccessMsg(`Document "${doc.title}" was soft-deleted. Unauthorized downloads are now prevented.`);
+      fetchDocuments();
+    } catch (err: any) {
+      setError(`Failed to delete document: ${err.message}`);
+    }
+  };
+
+  // Permission Management Modal Handlers
+  const openPermissionModal = async (doc: DocumentItem) => {
+    setPermissionModalDoc(doc);
+    setGrantTargetEmail('');
+    setGrantPermissionLevel('Read');
+    setPermissionLoading(true);
+    setError(null);
+    try {
+      const perms = await api.getPermissions(doc.id);
+      setActivePermissions(perms);
+    } catch (err: any) {
+      setError(`Failed to load permissions: ${err.message}`);
+    } finally {
+      setPermissionLoading(false);
+    }
+  };
+
+  const handleGrantPermissionSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!permissionModalDoc || !grantTargetEmail.trim()) return;
+
+    setPermissionLoading(true);
+    setError(null);
+    try {
+      const res = await api.grantPermission(permissionModalDoc.id, grantTargetEmail.trim(), grantPermissionLevel);
+      setSuccessMsg(res.message);
+      setGrantTargetEmail('');
+      const updatedPerms = await api.getPermissions(permissionModalDoc.id);
+      setActivePermissions(updatedPerms);
+    } catch (err: any) {
+      setError(`Failed to grant permission: ${err.message}`);
+    } finally {
+      setPermissionLoading(false);
+    }
+  };
+
+  const handleRevokePermission = async (targetUserId: string, targetEmail: string) => {
+    if (!permissionModalDoc) return;
+    setPermissionLoading(true);
+    setError(null);
+    try {
+      const res = await api.revokePermission(permissionModalDoc.id, targetUserId);
+      setSuccessMsg(res.message || `Revoked access for ${targetEmail}`);
+      const updatedPerms = await api.getPermissions(permissionModalDoc.id);
+      setActivePermissions(updatedPerms);
+    } catch (err: any) {
+      setError(`Failed to revoke permission: ${err.message}`);
+    } finally {
+      setPermissionLoading(false);
     }
   };
 
@@ -180,10 +299,10 @@ export const App: React.FC = () => {
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <span className="logo-title">TrustVault</span>
-              <span className="logo-tag">DAY 1 CORE</span>
+              <span className="logo-tag">DAY 3 FINAL</span>
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-              Zero-Trust Secure Document Vault
+              Zero-Trust Secure Document Vault & Audit Chain
             </div>
           </div>
         </div>
@@ -191,7 +310,7 @@ export const App: React.FC = () => {
         <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
           {/* Health indicator */}
           <div className={`badge ${health?.status === 'Healthy' ? 'badge-healthy' : 'badge-degraded'}`}>
-            Backend: {health ? health.status : 'Connecting...'}
+            Backend: {health ? health.status : 'Connecting...'} ({health?.environment || 'Dev'})
           </div>
 
           {currentUser && (
@@ -201,7 +320,7 @@ export const App: React.FC = () => {
                 <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{currentUser.email}</div>
               </div>
               <span className={`badge ${currentUser.roles.includes('Admin') ? 'badge-admin' : 'badge-owner'}`}>
-                {currentUser.roles[0] || 'User'}
+                {currentUser.roles.join(', ') || 'User'}
               </span>
               <button className="btn btn-secondary" onClick={handleLogout} style={{ padding: '6px 12px' }}>
                 Sign Out
@@ -254,7 +373,7 @@ export const App: React.FC = () => {
                     <label>Assigned Role</label>
                     <select value={role} onChange={(e) => setRole(e.target.value)}>
                       <option value="Owner">Document Owner (Can upload and share)</option>
-                      <option value="Viewer">Viewer (Read-only on shared items)</option>
+                      <option value="Viewer">Viewer (Read-only on permitted items)</option>
                     </select>
                   </div>
                 </>
@@ -300,6 +419,18 @@ export const App: React.FC = () => {
       ) : (
         /* Authenticated Dashboard */
         <div>
+          {/* Security Workflow Checklist Banner */}
+          <div className="workflow-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontWeight: 600, fontSize: '13px', color: '#60a5fa' }}>
+                🛡️ Security Verification Flow:
+              </span>
+              <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                1. Upload (Owner) ➜ 2. Grant Read (Viewer) ➜ 3. Download (Viewer) ➜ 4. Revoke Access ➜ 5. Verify Denied (403) ➜ 6. Audit Trail
+              </span>
+            </div>
+          </div>
+
           {/* Navigation Tabs */}
           <div className="nav-tabs">
             <button
@@ -314,24 +445,41 @@ export const App: React.FC = () => {
             >
               Upload Document
             </button>
-            {currentUser.roles.includes('Admin') && (
-              <button
-                className={`tab-btn ${activeTab === 'audit' ? 'active' : ''}`}
-                onClick={() => setActiveTab('audit')}
-              >
-                Security Audit Log
-              </button>
-            )}
+            <button
+              className={`tab-btn ${activeTab === 'audit' ? 'active' : ''}`}
+              onClick={() => setActiveTab('audit')}
+            >
+              {currentUser.roles.includes('Admin') ? 'System Audit Trail' : 'My Activity Log'}
+            </button>
           </div>
 
           {/* Tab 1: Documents */}
           {activeTab === 'documents' && (
             <div className="glass-panel" style={{ padding: '24px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '12px' }}>
                 <h3 style={{ fontSize: '18px', fontWeight: 600 }}>Your Secure Documents</h3>
-                <button className="btn btn-secondary" onClick={fetchDocuments} disabled={loading}>
-                  Refresh
-                </button>
+
+                {/* Search Bar */}
+                <form onSubmit={handleSearchSubmit} className="search-input-group">
+                  <input
+                    type="text"
+                    placeholder="Search titles/files..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    style={{ width: '220px', padding: '6px 12px', fontSize: '13px' }}
+                  />
+                  <button type="submit" className="btn btn-secondary" style={{ padding: '6px 12px', fontSize: '13px' }}>
+                    Search
+                  </button>
+                  {searchQuery && (
+                    <button type="button" className="btn btn-secondary" onClick={handleClearSearch} style={{ padding: '6px 10px', fontSize: '13px' }}>
+                      Clear
+                    </button>
+                  )}
+                  <button type="button" className="btn btn-secondary" onClick={fetchDocuments} disabled={loading} style={{ padding: '6px 12px', fontSize: '13px' }}>
+                    Refresh
+                  </button>
+                </form>
               </div>
 
               {loading && documents.length === 0 ? (
@@ -340,7 +488,7 @@ export const App: React.FC = () => {
                 </div>
               ) : documents.length === 0 ? (
                 <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
-                  No documents found in your vault. Click "Upload Document" to protect your first file.
+                  {searchQuery ? `No documents matched "${searchQuery}". (Zero-leakage guarantee active).` : 'No documents found in your vault. Deposit a file to get started.'}
                 </div>
               ) : (
                 <div className="table-container">
@@ -372,13 +520,34 @@ export const App: React.FC = () => {
                             {new Date(doc.createdAtUtc).toLocaleDateString()}
                           </td>
                           <td>
-                            <button
-                              className="btn btn-secondary"
-                              style={{ padding: '4px 10px', fontSize: '12px' }}
-                              onClick={() => handleDownload(doc)}
-                            >
-                              Download
-                            </button>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                              <button
+                                className="btn btn-secondary"
+                                style={{ padding: '4px 10px', fontSize: '12px' }}
+                                onClick={() => handleDownload(doc)}
+                              >
+                                Download
+                              </button>
+
+                              {doc.isOwner && (
+                                <>
+                                  <button
+                                    className="btn btn-primary"
+                                    style={{ padding: '4px 10px', fontSize: '12px' }}
+                                    onClick={() => openPermissionModal(doc)}
+                                  >
+                                    Manage Access
+                                  </button>
+                                  <button
+                                    className="btn btn-secondary"
+                                    style={{ padding: '4px 8px', fontSize: '12px', color: '#f87171' }}
+                                    onClick={() => handleDelete(doc)}
+                                  >
+                                    Delete
+                                  </button>
+                                </>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -420,7 +589,7 @@ export const App: React.FC = () => {
                     required
                   />
                   <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '6px' }}>
-                    Files are stored in private non-web-accessible vault storage with unguessable keys.
+                    Files are stored in private isolated vault storage decoupled from original filename.
                   </div>
                 </div>
 
@@ -437,41 +606,66 @@ export const App: React.FC = () => {
           )}
 
           {/* Tab 3: Audit Trail */}
-          {activeTab === 'audit' && currentUser.roles.includes('Admin') && (
+          {activeTab === 'audit' && (
             <div className="glass-panel" style={{ padding: '24px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '12px' }}>
                 <div>
-                  <h3 style={{ fontSize: '18px', fontWeight: 600 }}>Security Audit Trail</h3>
+                  <h3 style={{ fontSize: '18px', fontWeight: 600 }}>
+                    {currentUser.roles.includes('Admin') ? 'Tamper-Evident Security Audit Trail' : 'My Audit Events'}
+                  </h3>
                   <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-                    Admins can view system activity but cannot read user documents without explicit permission.
+                    {currentUser.roles.includes('Admin')
+                      ? 'Admins can verify hash chain integrity, but cannot view document contents without explicit permission.'
+                      : 'Immutable chronological record of operations on your account and documents.'}
                   </p>
                 </div>
-                <button className="btn btn-secondary" onClick={fetchAuditLogs} disabled={loading}>
-                  Refresh Logs
-                </button>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  {currentUser.roles.includes('Admin') && (
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleVerifyAuditChain}
+                      disabled={loading}
+                      style={{ fontSize: '13px' }}
+                    >
+                      Verify Hash Chain Integrity
+                    </button>
+                  )}
+                  <button className="btn btn-secondary" onClick={fetchAuditLogs} disabled={loading} style={{ fontSize: '13px' }}>
+                    Refresh Logs
+                  </button>
+                </div>
               </div>
+
+              {auditVerification && (
+                <div className={`alert ${auditVerification.isValid ? 'alert-success' : 'alert-error'}`} style={{ marginBottom: '16px' }}>
+                  <strong>Hash Chain Status:</strong> {auditVerification.isValid ? 'VALID' : 'TAMPERED'} — Verified {auditVerification.totalEventsVerified} events. {auditVerification.violationDetails || 'All deterministic SHA-256 links intact.'}
+                </div>
+              )}
 
               <div className="table-container">
                 <table>
                   <thead>
                     <tr>
+                      <th>Seq #</th>
                       <th>Timestamp (UTC)</th>
                       <th>Action</th>
                       <th>Entity</th>
                       <th>User</th>
                       <th>Status</th>
                       <th>Details</th>
+                      {currentUser.roles.includes('Admin') && <th>Hash Fingerprint</th>}
                     </tr>
                   </thead>
                   <tbody>
-                    {auditLogs.map((log) => (
+                    {auditLogs.map((log: any) => (
                       <tr key={log.id}>
+                        <td style={{ fontWeight: 600, color: 'var(--text-muted)' }}>#{log.sequenceNumber || '-'}</td>
                         <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
                           {new Date(log.timestampUtc).toLocaleString()}
                         </td>
                         <td style={{ fontWeight: 600 }}>{log.action}</td>
                         <td>{log.entityType}</td>
-                        <td>{log.userEmail || 'Anonymous'}</td>
+                        <td>{log.userEmail || 'System/Anonymous'}</td>
                         <td>
                           <span
                             className={`badge ${
@@ -488,6 +682,11 @@ export const App: React.FC = () => {
                         <td style={{ fontSize: '13px', maxWidth: '300px', wordBreak: 'break-word' }}>
                           {log.details || '-'}
                         </td>
+                        {currentUser.roles.includes('Admin') && (
+                          <td style={{ fontSize: '11px', fontFamily: 'monospace', color: 'var(--text-muted)' }}>
+                            {log.currentHash ? `${log.currentHash.substring(0, 8)}...${log.currentHash.substring(56)}` : '-'}
+                          </td>
+                        )}
                       </tr>
                     ))}
                   </tbody>
@@ -495,6 +694,110 @@ export const App: React.FC = () => {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Permission Management Modal */}
+      {permissionModalDoc && (
+        <div className="modal-overlay" onClick={() => setPermissionModalDoc(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <h3 style={{ fontSize: '18px', fontWeight: 600 }}>Manage Access: {permissionModalDoc.title}</h3>
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '4px 8px', fontSize: '14px' }}
+                onClick={() => setPermissionModalDoc(null)}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Grant Permission Form */}
+            <form onSubmit={handleGrantPermissionSubmit} style={{ marginBottom: '24px' }}>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-end' }}>
+                <div style={{ flex: 1 }}>
+                  <label>Grant to User Email</label>
+                  <input
+                    type="email"
+                    placeholder="colleague@trustvault.local"
+                    value={grantTargetEmail}
+                    onChange={(e) => setGrantTargetEmail(e.target.value)}
+                    required
+                  />
+                </div>
+                <div style={{ width: '110px' }}>
+                  <label>Level</label>
+                  <select
+                    value={grantPermissionLevel}
+                    onChange={(e) => setGrantPermissionLevel(e.target.value as 'Read' | 'Edit')}
+                  >
+                    <option value="Read">Read</option>
+                    <option value="Edit">Edit</option>
+                  </select>
+                </div>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={permissionLoading}
+                  style={{ height: '42px', padding: '0 16px' }}
+                >
+                  Grant
+                </button>
+              </div>
+            </form>
+
+            {/* Current Active Permissions List */}
+            <h4 style={{ fontSize: '14px', fontWeight: 600, marginBottom: '10px' }}>Current Active Permissions</h4>
+            {permissionLoading && activePermissions.length === 0 ? (
+              <div style={{ color: 'var(--text-muted)', fontSize: '13px' }}>Loading permissions...</div>
+            ) : activePermissions.length === 0 ? (
+              <div style={{ color: 'var(--text-muted)', fontSize: '13px', fontStyle: 'italic' }}>
+                No external permissions granted. Only you (the owner) can access this document.
+              </div>
+            ) : (
+              <div className="table-container">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>User</th>
+                      <th>Permission</th>
+                      <th>Granted</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {activePermissions.map((perm) => (
+                      <tr key={perm.id}>
+                        <td style={{ fontWeight: 500 }}>{perm.userEmail}</td>
+                        <td>
+                          <span className="badge badge-viewer">{perm.permissionLevel}</span>
+                        </td>
+                        <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                          {new Date(perm.grantedAtUtc).toLocaleDateString()}
+                        </td>
+                        <td>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ padding: '4px 8px', fontSize: '11px', color: '#f87171' }}
+                            onClick={() => handleRevokePermission(perm.userId, perm.userEmail)}
+                            disabled={permissionLoading}
+                          >
+                            Revoke
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div style={{ marginTop: '20px', textAlign: 'right' }}>
+              <button className="btn btn-secondary" onClick={() => setPermissionModalDoc(null)}>
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

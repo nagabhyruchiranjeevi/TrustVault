@@ -51,3 +51,19 @@ export interface AuditEventItem {
   details?: string;
   status: string;
 }
+
+export interface DocumentPermissionItem {
+  id: string;
+  documentId: string;
+  userId: string;
+  userEmail: string;
+  permissionLevel: string;
+  grantedAtUtc: string;
+}
+
+export interface AuditVerificationResult {
+  isValid: boolean;
+  totalEventsVerified: number;
+  violationDetails?: string;
+  verifiedAtUtc: string;
+}

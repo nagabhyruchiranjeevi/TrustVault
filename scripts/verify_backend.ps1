@@ -5,19 +5,23 @@ Write-Host "=== Starting TrustVault.Api on http://localhost:5115 ==="
 $process = Start-Process -FilePath "$env:DOTNET_ROOT\dotnet.exe" -ArgumentList "run --project backend/TrustVault.Api/TrustVault.Api.csproj --urls http://localhost:5115" -PassThru
 
 try {
-    Write-Host "Waiting 6 seconds for API startup..."
-    Start-Sleep -Seconds 6
-
-    Write-Host "Calling Health Check: http://localhost:5115/api/health"
-    try {
-        $healthRes = Invoke-RestMethod -Uri "http://localhost:5115/api/health" -Method Get -TimeoutSec 5
-        Write-Host "Health Check (HTTP 200):" ($healthRes | ConvertTo-Json -Depth 4)
+    Write-Host "Waiting for backend API startup (polling http://localhost:5115/api/health)..."
+    $ready = $false
+    for ($i = 1; $i -le 15; $i++) {
+        Start-Sleep -Seconds 2
+        try {
+            $healthRes = Invoke-RestMethod -Uri "http://localhost:5115/api/health" -Method Get -TimeoutSec 3
+            Write-Host "Health Check (HTTP 200 - Ready on attempt $i):" ($healthRes | ConvertTo-Json -Depth 4)
+            $ready = $true
+            break
+        }
+        catch {
+            Write-Host "  ... waiting for startup (attempt $i/15)"
+        }
     }
-    catch {
-        $stream = $_.Exception.Response.GetResponseStream()
-        $reader = New-Object System.IO.StreamReader($stream)
-        $body = $reader.ReadToEnd()
-        Write-Host "Health Check Response (HTTP $($_.Exception.Response.StatusCode.value__)):`n$body"
+
+    if (-not $ready) {
+        Write-Warning "Backend did not respond within 30 seconds."
     }
 
     Write-Host "`nCalling Swagger JSON: http://localhost:5115/swagger/v1/swagger.json"

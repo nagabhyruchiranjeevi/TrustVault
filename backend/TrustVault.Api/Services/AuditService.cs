@@ -33,6 +33,8 @@ public class AuditService : IAuditService
         _logger = logger;
     }
 
+    private const int MaxConcurrencyRetries = 5;
+
     public async Task<AuditEvent> LogEventAsync(
         Guid? userId,
         string action,
@@ -46,56 +48,76 @@ public class AuditService : IAuditService
         await _chainLock.WaitAsync();
         try
         {
-            var latest = await _dbContext.AuditEvents
-                .OrderByDescending(a => a.SequenceNumber)
-                .FirstOrDefaultAsync();
-
-            var sequenceNumber = latest == null ? 1 : latest.SequenceNumber + 1;
-            var previousHash = latest == null ? GenesisHash : latest.CurrentHash;
-
-            var id = Guid.NewGuid();
-            var timestamp = DateTime.UtcNow;
-
-            var currentHash = AuditEvent.ComputeDeterministicHash(
-                previousHash,
-                sequenceNumber,
-                id,
-                timestamp,
-                userId,
-                action,
-                entityType,
-                entityId,
-                status,
-                details,
-                correlationId
-            );
-
-            var auditEvent = new AuditEvent
+            var attempts = 0;
+            while (true)
             {
-                Id = id,
-                SequenceNumber = sequenceNumber,
-                UserId = userId,
-                Action = action,
-                EntityType = entityType,
-                EntityId = entityId,
-                Details = details,
-                Status = status,
-                IpAddress = ipAddress,
-                CorrelationId = correlationId,
-                TimestampUtc = timestamp,
-                PreviousHash = previousHash,
-                CurrentHash = currentHash
-            };
+                attempts++;
+                AuditEvent? auditEvent = null;
+                try
+                {
+                    // AsNoTracking to get fresh database head without cache
+                    var latest = await _dbContext.AuditEvents
+                        .AsNoTracking()
+                        .OrderByDescending(a => a.SequenceNumber)
+                        .FirstOrDefaultAsync();
 
-            _dbContext.AuditEvents.Add(auditEvent);
-            await _dbContext.SaveChangesAsync();
+                    var sequenceNumber = latest == null ? 1 : latest.SequenceNumber + 1;
+                    var previousHash = latest == null ? GenesisHash : latest.CurrentHash;
 
-            return auditEvent;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to persist audit event for Action: {Action}, Entity: {EntityType}", action, entityType);
-            throw;
+                    var id = Guid.NewGuid();
+                    var timestamp = DateTime.UtcNow;
+
+                    var currentHash = AuditEvent.ComputeDeterministicHash(
+                        previousHash,
+                        sequenceNumber,
+                        id,
+                        timestamp,
+                        userId,
+                        action,
+                        entityType,
+                        entityId,
+                        status,
+                        details,
+                        correlationId
+                    );
+
+                    auditEvent = new AuditEvent
+                    {
+                        Id = id,
+                        SequenceNumber = sequenceNumber,
+                        UserId = userId,
+                        Action = action,
+                        EntityType = entityType,
+                        EntityId = entityId,
+                        Details = details,
+                        Status = status,
+                        IpAddress = ipAddress,
+                        CorrelationId = correlationId,
+                        TimestampUtc = timestamp,
+                        PreviousHash = previousHash,
+                        CurrentHash = currentHash
+                    };
+
+                    _dbContext.AuditEvents.Add(auditEvent);
+                    await _dbContext.SaveChangesAsync();
+
+                    return auditEvent;
+                }
+                catch (DbUpdateException dbEx) when (attempts < MaxConcurrencyRetries)
+                {
+                    _logger.LogWarning(dbEx, "Concurrency conflict on audit sequence insert (attempt {Attempt}/{MaxRetries}). Retrying with updated sequence and hash chain head.", attempts, MaxConcurrencyRetries);
+                    if (auditEvent != null)
+                    {
+                        _dbContext.Entry(auditEvent).State = EntityState.Detached;
+                    }
+                    await Task.Delay(Random.Shared.Next(10, 50));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to persist audit event for Action: {Action}, Entity: {EntityType} after attempt {Attempt}", action, entityType, attempts);
+                    throw;
+                }
+            }
         }
         finally
         {

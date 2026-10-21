@@ -1,4 +1,4 @@
-import type { AuthResponse, DocumentItem, HealthCheckResponse, User, AuditEventItem } from '../types';
+import type { AuthResponse, DocumentItem, HealthCheckResponse, User, AuditEventItem, DocumentPermissionItem, AuditVerificationResult } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5115/api';
 
@@ -98,6 +98,10 @@ class ApiClient {
     return this.request<DocumentItem[]>('/documents');
   }
 
+  async searchDocuments(query: string): Promise<DocumentItem[]> {
+    return this.request<DocumentItem[]>(`/documents/search?query=${encodeURIComponent(query)}`);
+  }
+
   async createDocument(title: string, fileName: string, contentType: string, base64Content: string): Promise<DocumentItem> {
     return this.request<DocumentItem>('/documents', {
       method: 'POST',
@@ -113,7 +117,15 @@ class ApiClient {
 
     const res = await fetch(`${API_BASE_URL}/documents/${id}/download`, { headers });
     if (!res.ok) {
-      throw new Error('Failed to download document');
+      let errMsg = 'Failed to download document';
+      try {
+        const data = await res.json();
+        errMsg = data.message || data.title || errMsg;
+      } catch {
+        if (res.status === 403) errMsg = 'Access Denied (403): You do not have permission to download this document.';
+        if (res.status === 404) errMsg = 'Document Not Found (404)';
+      }
+      throw new Error(errMsg);
     }
 
     const blob = await res.blob();
@@ -127,9 +139,41 @@ class ApiClient {
     document.body.removeChild(a);
   }
 
-  // Audit Logs (Admin only)
+  async deleteDocument(id: string): Promise<void> {
+    await this.request<void>(`/documents/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Permissions Management
+  async getPermissions(documentId: string): Promise<DocumentPermissionItem[]> {
+    return this.request<DocumentPermissionItem[]>(`/documents/${documentId}/permissions`);
+  }
+
+  async grantPermission(documentId: string, userEmail: string, permissionLevel: 'Read' | 'Edit'): Promise<{ message: string }> {
+    return this.request<{ message: string }>(`/documents/${documentId}/permissions`, {
+      method: 'POST',
+      body: JSON.stringify({ userEmail, permissionLevel }),
+    });
+  }
+
+  async revokePermission(documentId: string, targetUserId: string): Promise<{ message: string }> {
+    return this.request<{ message: string }>(`/documents/${documentId}/permissions/${targetUserId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Audit Logs
   async getAuditLogs(): Promise<AuditEventItem[]> {
     return this.request<AuditEventItem[]>('/audit');
+  }
+
+  async getMyAuditLogs(): Promise<AuditEventItem[]> {
+    return this.request<AuditEventItem[]>('/audit/me');
+  }
+
+  async verifyAuditIntegrity(): Promise<AuditVerificationResult> {
+    return this.request<AuditVerificationResult>('/audit/verify');
   }
 }
 
