@@ -40,7 +40,7 @@ public class HealthController : ControllerBase
             Status = status,
             Environment = _env.EnvironmentName,
             TimestampUtc = DateTime.UtcNow,
-            Version = "1.0.0-day1",
+            Version = "1.0.0",
             Checks = new
             {
                 Database = new

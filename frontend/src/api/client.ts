@@ -145,6 +145,13 @@ class ApiClient {
     });
   }
 
+  async updateDocument(id: string, title: string): Promise<{ message: string }> {
+    return this.request<{ message: string }>(`/documents/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ title }),
+    });
+  }
+
   // Permissions Management
   async getPermissions(documentId: string): Promise<DocumentPermissionItem[]> {
     return this.request<DocumentPermissionItem[]>(`/documents/${documentId}/permissions`);

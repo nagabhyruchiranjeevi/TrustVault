@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json.Serialization;
 using FluentValidation;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
@@ -106,7 +107,11 @@ builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddValidatorsFromAssemblyContaining<RegisterRequestValidator>();
 
 // 6. Controllers and CORS
-builder.Services.AddControllers();
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+    });
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("TrustVaultCorsPolicy", policy =>
@@ -126,7 +131,7 @@ builder.Services.AddSwaggerGen(c =>
     {
         Title = "TrustVault Secure Document API",
         Version = "v1",
-        Description = "TrustVault Day 1 Core API - Secure authentication, role-based governance, and resource-authorized document storage."
+        Description = "TrustVault Secure Document API - Zero-trust authentication, role-based governance, and resource-authorized document storage."
     });
 
     c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme

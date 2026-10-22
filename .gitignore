@@ -39,10 +39,16 @@ database/data/
 uploads/
 storage/temp/
 *.db           # SQLite dev databases — never commit real data
+**/*.db
 *.db-wal
+**/*.db-wal
 *.db-shm
+**/*.db-shm
 *.sqlite*
+**/*.sqlite*
 SecureVaultStorage/   # Local file vault — never commit stored documents
+**/SecureVaultStorage/
+**/SecureVaultStorage/**
 
 # OS Generated Files
 Thumbs.db

@@ -108,6 +108,7 @@ public class DocumentsController : ControllerBase
     {
         var document = await _dbContext.Documents
             .Include(d => d.Owner)
+            .Include(d => d.Permissions)
             .FirstOrDefaultAsync(d => d.Id == id && !d.IsDeleted);
 
         if (document == null)

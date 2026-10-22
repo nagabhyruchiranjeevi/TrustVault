@@ -45,12 +45,18 @@ public class AuditEvent
         string? details,
         string? correlationId)
     {
-        // Canonical deterministic string representation
+        // Canonical deterministic string representation with fixed millisecond ISO-8601 formatting.
+        // Guarantee UTC interpretation without timezone shifts when EF Core loads Unspecified kinds from SQLite.
+        var utc = timestampUtc.Kind == DateTimeKind.Utc
+            ? timestampUtc
+            : DateTime.SpecifyKind(timestampUtc, DateTimeKind.Utc);
+        var canonicalTimestamp = utc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+
         var rawPayload = string.Join("|",
             previousHash ?? string.Empty,
             sequenceNumber.ToString(),
             id.ToString(),
-            timestampUtc.ToString("o"), // ISO 8601 round-trip format
+            canonicalTimestamp,
             userId?.ToString() ?? "ANONYMOUS",
             action ?? string.Empty,
             entityType ?? string.Empty,

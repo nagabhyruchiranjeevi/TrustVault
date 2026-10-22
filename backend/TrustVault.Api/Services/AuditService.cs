@@ -65,7 +65,8 @@ public class AuditService : IAuditService
                     var previousHash = latest == null ? GenesisHash : latest.CurrentHash;
 
                     var id = Guid.NewGuid();
-                    var timestamp = DateTime.UtcNow;
+                    var rawTs = DateTime.UtcNow;
+                    var timestamp = new DateTime(rawTs.Year, rawTs.Month, rawTs.Day, rawTs.Hour, rawTs.Minute, rawTs.Second, rawTs.Millisecond, DateTimeKind.Utc);
 
                     var currentHash = AuditEvent.ComputeDeterministicHash(
                         previousHash,

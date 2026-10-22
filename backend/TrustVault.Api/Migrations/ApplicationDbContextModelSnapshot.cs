@@ -242,6 +242,15 @@ namespace TrustVault.Api.Migrations
                         .HasMaxLength(100)
                         .HasColumnType("character varying(100)");
 
+                    b.Property<string>("CorrelationId")
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<string>("CurrentHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.Property<string>("Details")
                         .HasColumnType("text");
 
@@ -258,6 +267,14 @@ namespace TrustVault.Api.Migrations
                         .HasMaxLength(50)
                         .HasColumnType("character varying(50)");
 
+                    b.Property<string>("PreviousHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<long>("SequenceNumber")
+                        .HasColumnType("bigint");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasMaxLength(50)
@@ -272,6 +289,9 @@ namespace TrustVault.Api.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("Action");
+
+                    b.HasIndex("SequenceNumber")
+                        .IsUnique();
 
                     b.HasIndex("TimestampUtc");
 

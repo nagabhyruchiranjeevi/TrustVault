@@ -1,4 +1,4 @@
-# TrustVault — Day 3 Finalization
+# TrustVault — Zero-Trust Secure Document Vault
 
 TrustVault is an enterprise zero-trust secure document management and vaulting platform designed with strict access governance, granular resource-based authorization, unguessable isolated storage, and a tamper-evident cryptographic audit hash chain.
 
