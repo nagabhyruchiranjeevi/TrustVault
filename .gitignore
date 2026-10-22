@@ -62,3 +62,8 @@ TestResults/
 *.trx
 *.coverage
 *.opencover.xml
+
+# Generated Demo Recordings
+docs/demo/
+*.mp4
+

@@ -46,7 +46,7 @@ public class HealthController : ControllerBase
                 Database = new
                 {
                     Status = dbHealthy ? "Healthy" : "Unhealthy",
-                    Error = dbError
+                    Error = _env.IsDevelopment() ? dbError : (dbHealthy ? null : "Database connection failed")
                 }
             }
         });
