@@ -2503,6 +2503,171 @@ public class RemoteStorageTests : IDisposable
             It.IsAny<string?>()), Times.Once);
     }
 
+    // ──────────────────────────────────────────────────────────
+    // Diagnostic Storage Probe Tests
+    // ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void ExecuteStorageDiagnosticProbe_Attribute_EnforcesAdminAuthorization()
+    {
+        var method = typeof(HealthController).GetMethod(nameof(HealthController.ExecuteStorageDiagnosticProbe));
+        method.Should().NotBeNull();
+
+        var authAttr = method!.GetCustomAttributes(typeof(AuthorizeAttribute), false)
+            .Cast<AuthorizeAttribute>()
+            .FirstOrDefault();
+
+        authAttr.Should().NotBeNull();
+        authAttr!.Roles.Should().Be(Roles.Admin);
+    }
+
+    [Fact]
+    public async Task ExecuteStorageDiagnosticProbe_WhenStorageSucceeds_PerformsRoundTrip_AndConfirmsDeletion()
+    {
+        var controller = new HealthController(_dbContext, _envMock.Object);
+        var storageMock = new Mock<IDocumentStorageService>();
+        var generatedKey = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var payloadBytes = "probe-ping-2026"u8.ToArray();
+
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "probe-synthetic.tmp", "application/octet-stream", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(generatedKey);
+
+        var readCallCount = 0;
+        storageMock.Setup(s => s.GetDocumentStreamAsync(generatedKey, It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                readCallCount++;
+                if (readCallCount == 1)
+                {
+                    return Task.FromResult<Stream>(new MemoryStream(payloadBytes));
+                }
+                // Second call confirms deletion: must report object missing
+                throw new FileNotFoundException("Object missing from storage bucket.");
+            });
+
+        storageMock.Setup(s => s.DeleteDocumentAsync(generatedKey, It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        var result = await controller.ExecuteStorageDiagnosticProbe(storageMock.Object, CancellationToken.None);
+
+        // Assert
+        var okResult = result.Should().BeOfType<ObjectResult>().Subject;
+        okResult.StatusCode.Should().Be(StatusCodes.Status200OK);
+
+        var val = okResult.Value?.ToString() ?? "";
+        val.Should().Contain("Status = Verified");
+        val.Should().Contain("Upload = Success");
+        val.Should().Contain("ReadBack = Success");
+        val.Should().Contain("ContentVerified = True");
+        val.Should().Contain("Deletion = Success");
+        val.Should().Contain("DeletionConfirmed = True");
+        val.Should().Contain(generatedKey);
+
+        storageMock.Verify(s => s.DeleteDocumentAsync(generatedKey, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteStorageDiagnosticProbe_WhenUploadThrows_HandlesSafely_Returns502()
+    {
+        var controller = new HealthController(_dbContext, _envMock.Object);
+        var storageMock = new Mock<IDocumentStorageService>();
+
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new AmazonS3Exception("Invalid credentials or bucket unreachable"));
+
+        // Act
+        var result = await controller.ExecuteStorageDiagnosticProbe(storageMock.Object, CancellationToken.None);
+
+        // Assert
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+
+        var val = statusResult.Value?.ToString() ?? "";
+        val.Should().Contain("Status = Failed");
+        val.Should().Contain("Upload = Failed");
+        val.Should().Contain("FailureStage = UploadFailed");
+        val.Should().Contain("ErrorCategory = AmazonS3Exception");
+        val.Should().NotContain("Invalid credentials or bucket unreachable"); // Never leaks exception messages
+    }
+
+    [Fact]
+    public async Task ExecuteStorageDiagnosticProbe_WhenReadBackBytesMismatch_CleansUpAndReturns502()
+    {
+        var controller = new HealthController(_dbContext, _envMock.Object);
+        var storageMock = new Mock<IDocumentStorageService>();
+        var generatedKey = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var corruptBytes = "corrupted-content"u8.ToArray();
+
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(generatedKey);
+
+        var readCallCount = 0;
+        storageMock.Setup(s => s.GetDocumentStreamAsync(generatedKey, It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                readCallCount++;
+                if (readCallCount == 1)
+                {
+                    return Task.FromResult<Stream>(new MemoryStream(corruptBytes));
+                }
+                throw new FileNotFoundException("Object missing from storage bucket.");
+            });
+
+        storageMock.Setup(s => s.DeleteDocumentAsync(generatedKey, It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        var result = await controller.ExecuteStorageDiagnosticProbe(storageMock.Object, CancellationToken.None);
+
+        // Assert
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+
+        var val = statusResult.Value?.ToString() ?? "";
+        val.Should().Contain("Status = Failed");
+        val.Should().Contain("Upload = Success");
+        val.Should().Contain("ReadBack = Success");
+        val.Should().Contain("ContentVerified = False");
+        val.Should().Contain("Deletion = Success");
+        val.Should().Contain("DeletionConfirmed = True");
+        val.Should().Contain("FailureStage = ContentVerificationMismatch");
+
+        storageMock.Verify(s => s.DeleteDocumentAsync(generatedKey, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteStorageDiagnosticProbe_WhenCleanupThrows_ReportsFailureAndRetainsProbeKey()
+    {
+        var controller = new HealthController(_dbContext, _envMock.Object);
+        var storageMock = new Mock<IDocumentStorageService>();
+        var generatedKey = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var payloadBytes = "probe-ping-2026"u8.ToArray();
+
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(generatedKey);
+
+        storageMock.Setup(s => s.GetDocumentStreamAsync(generatedKey, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(payloadBytes));
+
+        storageMock.Setup(s => s.DeleteDocumentAsync(generatedKey, It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("Transient delete timeout"));
+
+        // Act
+        var result = await controller.ExecuteStorageDiagnosticProbe(storageMock.Object, CancellationToken.None);
+
+        // Assert
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+
+        var val = statusResult.Value?.ToString() ?? "";
+        val.Should().Contain("Status = Failed");
+        val.Should().Contain("Deletion = Failed");
+        val.Should().Contain("DeletionConfirmed = False");
+        val.Should().Contain("CleanupFailed:InvalidOperationException");
+        val.Should().Contain(generatedKey); // Must report exact probe key for manual remediation
+    }
+
     private class FlakyTestDbContext : ApplicationDbContext
     {
         public bool DisableFailure { get; set; }
