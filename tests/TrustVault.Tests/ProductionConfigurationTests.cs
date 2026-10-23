@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using FluentAssertions;
+using Microsoft.Extensions.Configuration;
 using Npgsql;
 using Xunit;
 
@@ -337,5 +338,186 @@ public class ProductionConfigurationTests
     {
         var isDefault = password == "Admin#TrustVault2026!";
         isDefault.Should().Be(shouldReject);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  ResolveDatabaseConfiguration Regression Tests
+    // ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_ConnectionStringsDefaultConnection_SupabaseUri_IsNormalizedToNpgsqlFormat()
+    {
+        // Arrange — simulates Render deployment setting ConnectionStrings__DefaultConnection to a Supabase URI
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "PostgreSQL",
+            ["ConnectionStrings:DefaultConnection"] = "postgres://postgres.glstabcxyz:TestPass2026@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: true);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert — provider must be PostgreSQL and connStr must NOT be the raw URI; it must be valid Npgsql key-value
+        provider.Should().Be("PostgreSQL");
+        parsed.Host.Should().Be("aws-0-us-east-1.pooler.supabase.com");
+        parsed.Port.Should().Be(5432);
+        parsed.Database.Should().Be("postgres");
+        parsed.Username.Should().Be("postgres.glstabcxyz");
+        parsed.SslMode.Should().Be(SslMode.Require);
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_DatabaseUrl_WithEnclosingDoubleQuotes_StripsQuotesAndNormalizes()
+    {
+        // Arrange — raw DATABASE_URL surrounded by double quotes (e.g. from Render or .env)
+        var rawUrl = "\"postgres://vault_user:secret123@db.example.com:5432/trustvault\"";
+        var config = new ConfigurationBuilder().Build();
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: rawUrl, isProduction: true);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        provider.Should().Be("PostgreSQL");
+        parsed.Host.Should().Be("db.example.com");
+        parsed.Username.Should().Be("vault_user");
+        parsed.Database.Should().Be("trustvault");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_DatabaseUrl_WithEnclosingSingleQuotes_StripsQuotesAndNormalizes()
+    {
+        // Arrange — raw DATABASE_URL surrounded by single quotes
+        var rawUrl = "'postgres://vault_user:secret123@db.example.com:5432/trustvault'";
+        var config = new ConfigurationBuilder().Build();
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: rawUrl, isProduction: true);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        provider.Should().Be("PostgreSQL");
+        parsed.Host.Should().Be("db.example.com");
+        parsed.Username.Should().Be("vault_user");
+        parsed.Database.Should().Be("trustvault");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_PrioritizesRawDatabaseUrlOverConfigDefaultConnection()
+    {
+        // Arrange — both DATABASE_URL parameter and ConnectionStrings:DefaultConnection exist
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["ConnectionStrings:DefaultConnection"] = "Host=secondary.example.com;Port=5432;Database=db2;Username=u2;Password=p2;"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+        var rawUrl = "postgres://primary_user:primary_pass@primary.example.com:5432/primary_db";
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: rawUrl, isProduction: true);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert — DATABASE_URL must win
+        provider.Should().Be("PostgreSQL");
+        parsed.Host.Should().Be("primary.example.com");
+        parsed.Username.Should().Be("primary_user");
+        parsed.Database.Should().Be("primary_db");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_StandardHostConnectionString_PassedThroughUnchanged()
+    {
+        // Arrange — standard Npgsql key-value connection string in ConnectionStrings:DefaultConnection
+        var standardConn = "Host=myhost.example.com;Port=5432;Database=mydb;Username=myuser;Password=mypass;";
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "PostgreSQL",
+            ["ConnectionStrings:DefaultConnection"] = standardConn
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: true);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        provider.Should().Be("PostgreSQL");
+        parsed.Host.Should().Be("myhost.example.com");
+        parsed.Username.Should().Be("myuser");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_InfersPostgreSqlWhenCandidateExistsWithoutExplicitProvider()
+    {
+        // Arrange — DatabaseProvider not specified, but postgresql:// URI present in DefaultConnection
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["ConnectionStrings:DefaultConnection"] = "postgresql://inferred_user:pass@host.example.com:5432/inferred_db"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: false);
+
+        // Assert
+        provider.Should().Be("PostgreSQL");
+        connStr.Should().Contain("Host=host.example.com");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_DefaultsToSqliteWhenNoPostgreSqlCandidateExists()
+    {
+        // Arrange — empty config
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["ConnectionStrings:SqliteConnection"] = "Data Source=custom.db"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: false);
+
+        // Assert
+        provider.Should().Be("Sqlite");
+        connStr.Should().Be("Data Source=custom.db");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_Production_MissingPostgreSqlConnectionString_ThrowsSanitizedException()
+    {
+        // Arrange — Production with DatabaseProvider=PostgreSQL but no connection strings
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "PostgreSQL"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var act = () => Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: true);
+
+        // Assert — fails fast in production rather than silently using dev localhost fallback
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*PostgreSQL*production*");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_InvalidPostgreSqlConnectionString_ThrowsSanitizedException()
+    {
+        // Arrange — non-URI and non-key-value garbage string
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "PostgreSQL",
+            ["ConnectionStrings:DefaultConnection"] = "some-invalid-format-string"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var act = () => Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: false);
+
+        // Assert — fails with sanitized error, no secrets leaked
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*CRITICAL DATABASE CONFIGURATION ERROR*");
     }
 }

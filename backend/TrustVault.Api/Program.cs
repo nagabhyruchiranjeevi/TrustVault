@@ -25,33 +25,23 @@ if (!string.IsNullOrEmpty(port))
 }
 
 // 1. Database & EF Core setup (Supports PostgreSQL for production/staging and SQLite for local development)
-var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
-var databaseProvider = builder.Configuration["DatabaseProvider"] 
-    ?? (!string.IsNullOrEmpty(databaseUrl) ? "PostgreSQL" : "Sqlite");
+var isProduction = builder.Environment.IsProduction() ||
+                   builder.Configuration["ASPNETCORE_ENVIRONMENT"]?.Equals("Production", StringComparison.OrdinalIgnoreCase) == true;
 
-string pgConnectionString;
-if (!string.IsNullOrEmpty(databaseUrl))
-{
-    pgConnectionString = ParseDatabaseUrlToNpgsql(databaseUrl);
-}
-else
-{
-    pgConnectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
-        ?? "Host=localhost;Port=5432;Database=trustvault_db;Username=postgres;Password=postgres;";
-}
-
-var sqliteConnectionString = builder.Configuration.GetConnectionString("SqliteConnection") 
-    ?? "Data Source=trustvault.db";
+var (databaseProvider, resolvedConnectionString) = ResolveDatabaseConfiguration(
+    builder.Configuration,
+    Environment.GetEnvironmentVariable("DATABASE_URL"),
+    isProduction);
 
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
 {
     if (databaseProvider.Equals("PostgreSQL", StringComparison.OrdinalIgnoreCase))
     {
-        options.UseNpgsql(pgConnectionString);
+        options.UseNpgsql(resolvedConnectionString);
     }
     else
     {
-        options.UseSqlite(sqliteConnectionString);
+        options.UseSqlite(resolvedConnectionString);
     }
 });
 
@@ -76,9 +66,6 @@ builder.Services.Configure<JwtOptions>(jwtSection);
 var jwtOptions = jwtSection.Get<JwtOptions>() ?? new JwtOptions();
 
 // Production Security Guard: Prevent silent fallback to known development secrets
-var isProduction = builder.Environment.IsProduction() ||
-                   builder.Configuration["ASPNETCORE_ENVIRONMENT"]?.Equals("Production", StringComparison.OrdinalIgnoreCase) == true;
-
 const string knownDevKey1 = "TrustVaultSuperSecretKeyForDevelopment2026!MustBeAtLeast32BytesLongForHmacSha256";
 const string knownDevKey2 = "TrustVaultSuperSecretKeyForDevelopment2026!MustBeAtLeast32Bytes";
 
@@ -305,6 +292,98 @@ app.Run();
 public partial class Program
 {
     /// <summary>
+    /// Resolves and normalizes the database provider and connection string from configuration sources
+    /// (DATABASE_URL environment variable, builder.Configuration["DATABASE_URL"], ConnectionStrings:DefaultConnection, etc.).
+    /// Guarantees that any PostgreSQL URI format (postgres:// or postgresql://) from ANY configuration source
+    /// is converted into a valid Npgsql connection string, validated with NpgsqlConnectionStringBuilder,
+    /// before EF Core receives it.
+    /// </summary>
+    public static (string Provider, string ConnectionString) ResolveDatabaseConfiguration(
+        IConfiguration configuration,
+        string? rawDatabaseUrl = null,
+        bool isProduction = false)
+    {
+        // 1. Determine explicit or inferred database provider
+        var configuredProvider = configuration["DatabaseProvider"];
+
+        // 2. Discover potential PostgreSQL connection string candidates in priority order:
+        //    Priority 1: rawDatabaseUrl parameter (e.g. Environment.GetEnvironmentVariable("DATABASE_URL"))
+        //    Priority 2: configuration["DATABASE_URL"]
+        //    Priority 3: configuration.GetConnectionString("DefaultConnection") (ConnectionStrings:DefaultConnection / ConnectionStrings__DefaultConnection)
+        string? candidatePg = null;
+
+        if (!string.IsNullOrWhiteSpace(rawDatabaseUrl))
+        {
+            candidatePg = rawDatabaseUrl.Trim();
+        }
+        else if (!string.IsNullOrWhiteSpace(configuration["DATABASE_URL"]))
+        {
+            candidatePg = configuration["DATABASE_URL"]!.Trim();
+        }
+        else if (!string.IsNullOrWhiteSpace(configuration.GetConnectionString("DefaultConnection")))
+        {
+            candidatePg = configuration.GetConnectionString("DefaultConnection")!.Trim();
+        }
+
+        // 3. Determine provider:
+        // - If configuredProvider is explicitly given, honor it.
+        // - Otherwise, if a PostgreSQL connection string candidate is present, infer "PostgreSQL".
+        // - Else default to "Sqlite".
+        string provider;
+        if (!string.IsNullOrWhiteSpace(configuredProvider))
+        {
+            provider = configuredProvider.Trim();
+        }
+        else if (!string.IsNullOrWhiteSpace(candidatePg))
+        {
+            provider = "PostgreSQL";
+        }
+        else
+        {
+            provider = "Sqlite";
+        }
+
+        if (provider.Equals("PostgreSQL", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(candidatePg))
+            {
+                if (isProduction)
+                {
+                    throw new InvalidOperationException(
+                        "CRITICAL DATABASE CONFIGURATION ERROR: PostgreSQL was selected as the database provider in production, " +
+                        "but neither DATABASE_URL nor ConnectionStrings__DefaultConnection was configured.");
+                }
+
+                // Development fallback
+                candidatePg = "Host=localhost;Port=5432;Database=trustvault_db;Username=postgres;Password=postgres;";
+            }
+
+            // Normalize the connection string (handles postgres:// and postgresql:// URIs, strips quotes, configures SSL)
+            string normalized = ParseDatabaseUrlToNpgsql(candidatePg);
+
+            // Validate that the normalized connection string conforms to Npgsql specification
+            try
+            {
+                var _ = new NpgsqlConnectionStringBuilder(normalized);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL DATABASE CONFIGURATION ERROR: The configured PostgreSQL connection string does not conform to Npgsql specification. " +
+                    "Ensure DATABASE_URL or ConnectionStrings__DefaultConnection is a valid URI or standard key-value connection string.", ex);
+            }
+
+            return ("PostgreSQL", normalized);
+        }
+        else
+        {
+            var sqliteConn = configuration.GetConnectionString("SqliteConnection")
+                ?? "Data Source=trustvault.db";
+            return ("Sqlite", sqliteConn);
+        }
+    }
+
+    /// <summary>
     /// Converts a DATABASE_URL (URI or standard connection string) into a secure Npgsql connection string.
     /// Uses NpgsqlConnectionStringBuilder to safely encode credentials, support colons/semicolons in passwords,
     /// and configure SSL settings for Supabase, Render, and cloud PostgreSQL providers.
@@ -314,10 +393,15 @@ public partial class Program
         if (string.IsNullOrWhiteSpace(databaseUrl)) return databaseUrl;
 
         var trimmed = databaseUrl.Trim();
+        if ((trimmed.StartsWith('"') && trimmed.EndsWith('"')) || (trimmed.StartsWith('\'') && trimmed.EndsWith('\'')))
+        {
+            trimmed = trimmed.Substring(1, trimmed.Length - 2).Trim();
+        }
+
         if (!trimmed.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) &&
             !trimmed.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
         {
-            return databaseUrl;
+            return trimmed;
         }
 
         if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
