@@ -327,14 +327,14 @@ public partial class Program
 
         // 3. Determine provider:
         // - If configuredProvider is explicitly given, honor it.
-        // - Otherwise, if a PostgreSQL connection string candidate is present, infer "PostgreSQL".
+        // - Otherwise, if a PostgreSQL connection string candidate is present (and safe if in production), infer "PostgreSQL".
         // - Else default to "Sqlite".
         string provider;
         if (!string.IsNullOrWhiteSpace(configuredProvider))
         {
             provider = configuredProvider.Trim();
         }
-        else if (!string.IsNullOrWhiteSpace(candidatePg))
+        else if (!string.IsNullOrWhiteSpace(candidatePg) && (!isProduction || !IsUnsafeDevelopmentConnectionString(candidatePg)))
         {
             provider = "PostgreSQL";
         }
@@ -359,12 +359,13 @@ public partial class Program
             }
 
             // Normalize the connection string (handles postgres:// and postgresql:// URIs, strips quotes, configures SSL)
-            string normalized = ParseDatabaseUrlToNpgsql(candidatePg);
+            string normalized = ParseDatabaseUrlToNpgsql(candidatePg, isProduction);
 
             // Validate that the normalized connection string conforms to Npgsql specification
+            NpgsqlConnectionStringBuilder parsedBuilder;
             try
             {
-                var _ = new NpgsqlConnectionStringBuilder(normalized);
+                parsedBuilder = new NpgsqlConnectionStringBuilder(normalized);
             }
             catch (Exception ex)
             {
@@ -373,10 +374,25 @@ public partial class Program
                     "Ensure DATABASE_URL or ConnectionStrings__DefaultConnection is a valid URI or standard key-value connection string.", ex);
             }
 
+            // In production, verify that the normalized connection string does not target localhost or use dev credentials
+            if (isProduction && IsUnsafeDevelopmentConnectionString(normalized))
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL DATABASE CONFIGURATION ERROR: A development or localhost PostgreSQL connection string cannot be used in production. " +
+                    "Ensure a valid production DATABASE_URL or ConnectionStrings__DefaultConnection is configured.");
+            }
+
             return ("PostgreSQL", normalized);
         }
         else
         {
+            if (isProduction)
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL DATABASE CONFIGURATION ERROR: SQLite is not permitted in production. " +
+                    "PostgreSQL must be configured for production environments via DATABASE_URL or ConnectionStrings__DefaultConnection.");
+            }
+
             var sqliteConn = configuration.GetConnectionString("SqliteConnection")
                 ?? "Data Source=trustvault.db";
             return ("Sqlite", sqliteConn);
@@ -385,10 +401,11 @@ public partial class Program
 
     /// <summary>
     /// Converts a DATABASE_URL (URI or standard connection string) into a secure Npgsql connection string.
-    /// Uses NpgsqlConnectionStringBuilder to safely encode credentials, support colons/semicolons in passwords,
+    /// Uses NpgsqlConnectionStringBuilder to safely encode credentials, support colons/semicolons/hashes in passwords,
     /// and configure SSL settings for Supabase, Render, and cloud PostgreSQL providers.
+    /// Supports both standard RFC 3986 URIs and database URIs containing unescaped special characters in credentials (e.g. '#', '@', '\', '?').
     /// </summary>
-    public static string ParseDatabaseUrlToNpgsql(string databaseUrl)
+    public static string ParseDatabaseUrlToNpgsql(string databaseUrl, bool isProduction = false)
     {
         if (string.IsNullOrWhiteSpace(databaseUrl)) return databaseUrl;
 
@@ -404,48 +421,80 @@ public partial class Program
             return trimmed;
         }
 
-        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+        // Validate port and percent-escapes in the URI before proceeding
+        ValidatePortInUri(trimmed);
+        ValidateDatabasePathInUri(trimmed);
+
+        string? host = null;
+        int port = 5432;
+        string? database = null;
+        string? username = null;
+        string? password = null;
+        string? queryString = null;
+
+        // Attempt parsing via standard Uri.TryCreate first.
+        // If the password contains unencoded '#', '?', or other special characters, Uri.TryCreate either fails,
+        // misplaces credentials into Fragment, or corrupts query/userinfo.
+        if (Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) &&
+            !string.IsNullOrWhiteSpace(uri.Host) &&
+            string.IsNullOrEmpty(uri.Fragment) &&
+            !uri.UserInfo.Contains('?') &&
+            Uri.CheckHostName(uri.Host) != UriHostNameType.Unknown)
         {
-            throw new ArgumentException("The provided DATABASE_URL is not a valid absolute URI.");
+            host = uri.Host;
+            if (uri.Port > 0) port = uri.Port;
+            var db = uri.AbsolutePath.TrimStart('/');
+            if (!string.IsNullOrWhiteSpace(db)) database = SafeUnescapeDatabase(db);
+
+            if (!string.IsNullOrEmpty(uri.UserInfo))
+            {
+                var colonIndex = uri.UserInfo.IndexOf(':');
+                if (colonIndex >= 0)
+                {
+                    username = SafeUnescape(uri.UserInfo.Substring(0, colonIndex));
+                    password = SafeUnescape(uri.UserInfo.Substring(colonIndex + 1));
+                }
+                else
+                {
+                    username = SafeUnescape(uri.UserInfo);
+                }
+            }
+
+            if (!string.IsNullOrEmpty(uri.Query))
+            {
+                queryString = uri.Query.TrimStart('?');
+            }
+        }
+        else
+        {
+            // Robust direct extraction for database URIs with unencoded special characters in credentials
+            ParsePostgresUriDirect(trimmed, out host, out port, out database, out username, out password, out queryString);
         }
 
-        var builder = new NpgsqlConnectionStringBuilder();
-
-        if (string.IsNullOrWhiteSpace(uri.Host))
+        if (string.IsNullOrWhiteSpace(host))
         {
             throw new ArgumentException("The provided DATABASE_URL URI must specify a valid host.");
         }
 
-        builder.Host = uri.Host;
-
-        if (uri.Port > 0)
+        var builder = new NpgsqlConnectionStringBuilder
         {
-            builder.Port = uri.Port;
-        }
-        else
-        {
-            builder.Port = 5432;
-        }
+            Host = host,
+            Port = port
+        };
 
-        var database = uri.AbsolutePath.TrimStart('/');
         if (!string.IsNullOrWhiteSpace(database))
         {
-            builder.Database = Uri.UnescapeDataString(database);
+            builder.Database = database;
         }
 
-        var userInfo = uri.UserInfo;
-        if (!string.IsNullOrEmpty(userInfo))
+        if (!string.IsNullOrWhiteSpace(username))
         {
-            var colonIndex = userInfo.IndexOf(':');
-            if (colonIndex >= 0)
-            {
-                builder.Username = Uri.UnescapeDataString(userInfo.Substring(0, colonIndex));
-                builder.Password = Uri.UnescapeDataString(userInfo.Substring(colonIndex + 1));
-            }
-            else
-            {
-                builder.Username = Uri.UnescapeDataString(userInfo);
-            }
+            builder.Username = username;
+        }
+
+        if (!string.IsNullOrEmpty(password))
+        {
+            builder.Password = password;
         }
 
         // Default SSL configuration: Require encrypted connections to cloud PostgreSQL providers.
@@ -455,46 +504,354 @@ public partial class Program
         // Parse supported query parameters if present (e.g. ?sslmode=require&pooling=true).
         // Only an explicit allowlist of safe parameters is accepted; unknown parameters are
         // silently ignored to prevent URI query strings from changing security behavior.
-        if (!string.IsNullOrEmpty(uri.Query))
+        if (!string.IsNullOrWhiteSpace(queryString))
         {
-            var query = uri.Query.TrimStart('?');
-            var pairs = query.Split('&', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            foreach (var pair in pairs)
-            {
-                var eqIndex = pair.IndexOf('=');
-                if (eqIndex > 0)
-                {
-                    var key = Uri.UnescapeDataString(pair.Substring(0, eqIndex)).Trim();
-                    var val = Uri.UnescapeDataString(pair.Substring(eqIndex + 1)).Trim();
-
-                    if (key.Equals("sslmode", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (Enum.TryParse<SslMode>(val, true, out var parsedMode))
-                        {
-                            builder.SslMode = parsedMode;
-                        }
-                    }
-                    else if (key.Equals("channel_binding", StringComparison.OrdinalIgnoreCase) ||
-                             key.Equals("channelbinding", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (Enum.TryParse<ChannelBinding>(val, true, out var channelBinding))
-                        {
-                            builder.ChannelBinding = channelBinding;
-                        }
-                    }
-                    else if (key.Equals("pooling", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (bool.TryParse(val, out var pooling))
-                        {
-                            builder.Pooling = pooling;
-                        }
-                    }
-                    // All other query parameters are silently ignored to prevent
-                    // unrecognized keys from altering connection security settings.
-                }
-            }
+            ApplyQueryParameters(builder, queryString, isProduction);
         }
 
         return builder.ConnectionString;
     }
+
+    private static void ParsePostgresUriDirect(
+        string uriString,
+        out string? host,
+        out int port,
+        out string? database,
+        out string? username,
+        out string? password,
+        out string? queryString)
+    {
+        host = null;
+        port = 5432;
+        database = null;
+        username = null;
+        password = null;
+        queryString = null;
+
+        int schemeEnd = uriString.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd < 0)
+        {
+            throw new ArgumentException("The provided DATABASE_URL is not a valid absolute URI.");
+        }
+
+        string remainder = uriString.Substring(schemeEnd + 3);
+        if (string.IsNullOrWhiteSpace(remainder))
+        {
+            throw new ArgumentException("The provided DATABASE_URL is not a valid absolute URI.");
+        }
+
+        // 1. Separate userinfo from the remainder of the URI.
+        // In a database URI, authority credentials precede the LAST '@' before the host.
+        // This ensures unencoded '?', '#', ':', ';', or backslashes in passwords are not confused with query or path.
+        int atIndex = remainder.LastIndexOf('@');
+        string afterAuthority;
+        if (atIndex >= 0)
+        {
+            string userInfo = remainder.Substring(0, atIndex);
+            afterAuthority = remainder.Substring(atIndex + 1);
+
+            int colonIndex = userInfo.IndexOf(':');
+            if (colonIndex >= 0)
+            {
+                var u = SafeUnescape(userInfo.Substring(0, colonIndex));
+                var p = SafeUnescape(userInfo.Substring(colonIndex + 1));
+                if (!string.IsNullOrEmpty(u)) username = u;
+                if (!string.IsNullOrEmpty(p)) password = p;
+            }
+            else
+            {
+                var u = SafeUnescape(userInfo);
+                if (!string.IsNullOrEmpty(u)) username = u;
+            }
+        }
+        else
+        {
+            afterAuthority = remainder;
+        }
+
+        // 2. Separate query string (?...) from afterAuthority
+        int queryIndex = afterAuthority.IndexOf('?');
+        if (queryIndex >= 0)
+        {
+            queryString = afterAuthority.Substring(queryIndex + 1);
+            afterAuthority = afterAuthority.Substring(0, queryIndex);
+        }
+
+        // 3. Separate database path (/...) from afterAuthority
+        int pathIndex = afterAuthority.IndexOf('/');
+        if (pathIndex >= 0)
+        {
+            var dbPart = afterAuthority.Substring(pathIndex + 1).Trim();
+            if (!string.IsNullOrEmpty(dbPart))
+            {
+                database = SafeUnescapeDatabase(dbPart);
+            }
+            afterAuthority = afterAuthority.Substring(0, pathIndex);
+        }
+
+        // 4. Parse host and port from the remaining authority component
+        string hostPortPart = afterAuthority;
+        if (!string.IsNullOrWhiteSpace(hostPortPart))
+        {
+            if (hostPortPart.StartsWith("["))
+            {
+                int closeBracket = hostPortPart.IndexOf(']');
+                if (closeBracket > 0)
+                {
+                    host = hostPortPart.Substring(0, closeBracket + 1);
+                    int portColon = hostPortPart.IndexOf(':', closeBracket);
+                    if (portColon > 0)
+                    {
+                        var portStr = hostPortPart.Substring(portColon + 1);
+                        if (int.TryParse(portStr, out int p) && p > 0 && p <= 65535)
+                        {
+                            port = p;
+                        }
+                        else
+                        {
+                            throw new ArgumentException("The provided DATABASE_URL contains an invalid port.");
+                        }
+                    }
+                }
+                else
+                {
+                    throw new ArgumentException("The provided DATABASE_URL contains an invalid IPv6 host format.");
+                }
+            }
+            else
+            {
+                int colonIndex = hostPortPart.LastIndexOf(':');
+                if (colonIndex >= 0)
+                {
+                    host = hostPortPart.Substring(0, colonIndex);
+                    var portStr = hostPortPart.Substring(colonIndex + 1);
+                    if (int.TryParse(portStr, out int p) && p > 0 && p <= 65535)
+                    {
+                        port = p;
+                    }
+                    else
+                    {
+                        throw new ArgumentException("The provided DATABASE_URL contains an invalid port.");
+                    }
+                }
+                else
+                {
+                    host = hostPortPart;
+                }
+            }
+        }
+
+        // Validate host presence and format
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            throw new ArgumentException("The provided DATABASE_URL URI must specify a valid host.");
+        }
+
+        if (host.Contains(':') && !(host.StartsWith('[') && host.EndsWith(']')))
+        {
+            throw new ArgumentException("The provided DATABASE_URL is not a valid absolute URI.");
+        }
+
+        if (host.Contains(' ') || host.Contains('\t') || host.Contains('\r') || host.Contains('\n'))
+        {
+            throw new ArgumentException("The provided DATABASE_URL contains an invalid host.");
+        }
+    }
+
+    private static string SafeUnescape(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+        try
+        {
+            return Uri.UnescapeDataString(value);
+        }
+        catch
+        {
+            // For passwords containing unencoded '%', preserve the raw character sequence
+            return value;
+        }
+    }
+
+    private static string SafeUnescapeDatabase(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+        try
+        {
+            return Uri.UnescapeDataString(value);
+        }
+        catch (UriFormatException)
+        {
+            throw new ArgumentException("The provided DATABASE_URL contains an invalid database name with malformed percent escapes.");
+        }
+    }
+
+    private static void ApplyQueryParameters(NpgsqlConnectionStringBuilder builder, string queryString, bool isProduction = false)
+    {
+        var pairs = queryString.Split('&', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var pair in pairs)
+        {
+            var eqIndex = pair.IndexOf('=');
+            var key = eqIndex > 0 ? SafeUnescape(pair.Substring(0, eqIndex)).Trim() : SafeUnescape(pair).Trim();
+            var val = eqIndex > 0 ? SafeUnescape(pair.Substring(eqIndex + 1)).Trim() : string.Empty;
+
+            if (key.Equals("sslmode", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!Enum.TryParse<SslMode>(val, true, out var parsedMode))
+                {
+                    throw new ArgumentException($"The provided DATABASE_URL contains an invalid or unrecognized sslmode: '{val}'.");
+                }
+
+                if (isProduction && (parsedMode == SslMode.Disable || parsedMode == SslMode.Allow || parsedMode == SslMode.Prefer))
+                {
+                    throw new InvalidOperationException(
+                        $"CRITICAL DATABASE CONFIGURATION ERROR: Insecure SSL mode '{parsedMode}' is not permitted in production. " +
+                        "PostgreSQL connections in production must enforce TLS (Require, VerifyCA, or VerifyFull).");
+                }
+
+                builder.SslMode = parsedMode;
+            }
+            else if (key.Equals("channel_binding", StringComparison.OrdinalIgnoreCase) ||
+                     key.Equals("channelbinding", StringComparison.OrdinalIgnoreCase))
+            {
+                if (Enum.TryParse<ChannelBinding>(val, true, out var channelBinding))
+                {
+                    builder.ChannelBinding = channelBinding;
+                }
+            }
+            else if (key.Equals("pooling", StringComparison.OrdinalIgnoreCase))
+            {
+                if (bool.TryParse(val, out var pooling))
+                {
+                    builder.Pooling = pooling;
+                }
+            }
+        }
+    }
+
+    private static bool IsUnsafeDevelopmentConnectionString(string connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString)) return true;
+
+        try
+        {
+            var normalized = ParseDatabaseUrlToNpgsql(connectionString, isProduction: false);
+            var builder = new NpgsqlConnectionStringBuilder(normalized);
+
+            if (IsLocalhostOrLoopback(builder.Host))
+            {
+                return true;
+            }
+
+            if (string.Equals(builder.Username, "postgres", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(builder.Password, "postgres", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsLocalhostOrLoopback(string? host)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return true;
+        var trimmed = host.Trim().Trim('[', ']');
+        if (string.Equals(trimmed, "localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        if (trimmed == "127.0.0.1" || trimmed == "::1" || trimmed == "0.0.0.0") return true;
+        if (System.Net.IPAddress.TryParse(trimmed, out var ip) && System.Net.IPAddress.IsLoopback(ip)) return true;
+        return false;
+    }
+
+    private static void ValidatePortInUri(string uriString)
+    {
+        int schemeEnd = uriString.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd < 0) return;
+
+        string rest = uriString.Substring(schemeEnd + 3);
+        int atIndex = rest.LastIndexOf('@');
+        string afterAuth = atIndex >= 0 ? rest.Substring(atIndex + 1) : rest;
+
+        int endHostPort = afterAuth.IndexOfAny(new[] { '/', '?' });
+        string hostPort = endHostPort >= 0 ? afterAuth.Substring(0, endHostPort) : afterAuth;
+
+        if (hostPort.StartsWith("["))
+        {
+            int closeBracket = hostPort.IndexOf(']');
+            if (closeBracket > 0)
+            {
+                int colonIndex = hostPort.IndexOf(':', closeBracket);
+                if (colonIndex > 0)
+                {
+                    string portStr = hostPort.Substring(colonIndex + 1);
+                    if (!int.TryParse(portStr, out int p) || p <= 0 || p > 65535)
+                    {
+                        throw new ArgumentException("The provided DATABASE_URL contains an invalid port.");
+                    }
+                }
+            }
+            else
+            {
+                throw new ArgumentException("The provided DATABASE_URL contains an invalid IPv6 host format.");
+            }
+        }
+        else
+        {
+            int colonIndex = hostPort.LastIndexOf(':');
+            if (colonIndex >= 0)
+            {
+                string portStr = hostPort.Substring(colonIndex + 1);
+                if (!int.TryParse(portStr, out int p) || p <= 0 || p > 65535)
+                {
+                    throw new ArgumentException("The provided DATABASE_URL contains an invalid port.");
+                }
+            }
+        }
+    }
+
+    private static void ValidateDatabasePathInUri(string uriString)
+    {
+        int schemeEnd = uriString.IndexOf("://", StringComparison.Ordinal);
+        if (schemeEnd < 0) return;
+
+        string rest = uriString.Substring(schemeEnd + 3);
+        int atIndex = rest.LastIndexOf('@');
+        string afterAuth = atIndex >= 0 ? rest.Substring(atIndex + 1) : rest;
+
+        int slashIndex = afterAuth.IndexOf('/');
+        if (slashIndex >= 0)
+        {
+            string pathAndQuery = afterAuth.Substring(slashIndex + 1);
+            int qIndex = pathAndQuery.IndexOf('?');
+            string dbName = qIndex >= 0 ? pathAndQuery.Substring(0, qIndex) : pathAndQuery;
+            dbName = dbName.Trim();
+            if (!string.IsNullOrEmpty(dbName) && HasInvalidPercentEscape(dbName))
+            {
+                throw new ArgumentException("The provided DATABASE_URL contains an invalid database name with malformed percent escapes.");
+            }
+        }
+    }
+
+    private static bool HasInvalidPercentEscape(string str)
+    {
+        for (int i = 0; i < str.Length; i++)
+        {
+            if (str[i] == '%')
+            {
+                if (i + 2 >= str.Length || !IsHex(str[i + 1]) || !IsHex(str[i + 2]))
+                {
+                    return true;
+                }
+                i += 2;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsHex(char c) =>
+        (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+
 }

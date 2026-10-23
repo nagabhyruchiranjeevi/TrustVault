@@ -208,6 +208,253 @@ public class ProductionConfigurationTests
     }
 
     [Fact]
+    public void ParseDatabaseUrl_PasswordWithHash_ParsesCorrectlyWithoutThrowing()
+    {
+        // Arrange — password contains an unescaped '#' which breaks standard RFC 3986 URI parsers (treated as fragment)
+        var url = "postgresql://postgres.glstabcxyz:Synthetic#Pass2026!@aws-0-us-east-1.pooler.supabase.com:5432/postgres";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("aws-0-us-east-1.pooler.supabase.com");
+        parsed.Port.Should().Be(5432);
+        parsed.Database.Should().Be("postgres");
+        parsed.Username.Should().Be("postgres.glstabcxyz");
+        parsed.Password.Should().Be("Synthetic#Pass2026!");
+        parsed.SslMode.Should().Be(SslMode.Require);
+    }
+
+
+    [Fact]
+    public void ParseDatabaseUrl_PasswordWithUnencodedAtSymbol_ParsesCorrectly()
+    {
+        // Arrange — password contains an unescaped '@' (before host separator '@')
+        var url = "postgresql://vault_user:p@ssword123@aws-0-us-east-1.pooler.supabase.com:5432/trustvault_prod";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("aws-0-us-east-1.pooler.supabase.com");
+        parsed.Username.Should().Be("vault_user");
+        parsed.Password.Should().Be("p@ssword123");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_PasswordWithBackslash_ParsesCorrectly()
+    {
+        // Arrange — password contains backslash
+        var url = "postgresql://vault_user:pass\\word@host.example.com:5432/mydb";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("host.example.com");
+        parsed.Username.Should().Be("vault_user");
+        parsed.Password.Should().Be("pass\\word");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_IPv6HostInBrackets_ParsesCorrectly()
+    {
+        // Arrange — IPv6 address in brackets
+        var url = "postgresql://vault_user:secret@[2001:db8::1]:5432/mydb";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("[2001:db8::1]");
+        parsed.Port.Should().Be(5432);
+        parsed.Username.Should().Be("vault_user");
+        parsed.Password.Should().Be("secret");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_IPv6HostWithHashInPassword_ParsesCorrectly()
+    {
+        // Arrange — IPv6 address in brackets with '#' in password (forcing direct parser)
+        var url = "postgresql://vault_user:secret#pass@[2001:db8::1]:5432/mydb";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("[2001:db8::1]");
+        parsed.Port.Should().Be(5432);
+        parsed.Username.Should().Be("vault_user");
+        parsed.Password.Should().Be("secret#pass");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_PasswordWithQuestionMarkAndHashAndQuery_PreservesAllAndParsesQueryCorrectly()
+    {
+        // Arrange — password contains '?' and '#' while the URL also has query parameters
+        var url = "postgresql://vault_user:p?ss#w?rd@aws-0-us-east-1.pooler.supabase.com:5432/trustvault_prod?sslmode=require&pooling=true";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert — query params must not be confused with '?' in password
+        parsed.Host.Should().Be("aws-0-us-east-1.pooler.supabase.com");
+        parsed.Database.Should().Be("trustvault_prod");
+        parsed.Username.Should().Be("vault_user");
+        parsed.Password.Should().Be("p?ss#w?rd");
+        parsed.SslMode.Should().Be(SslMode.Require);
+        parsed.Pooling.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_PasswordWithCombinationOfSpecialCharacters_PreservesAll()
+    {
+        // Arrange — password with unencoded @, :, ;, #, ?, and backslash
+        var url = "postgresql://vault_user:p@ss:w;rd#1?2\\3@db.example.com:5432/mydb";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("db.example.com");
+        parsed.Username.Should().Be("vault_user");
+        parsed.Password.Should().Be("p@ss:w;rd#1?2\\3");
+    }
+
+    [Theory]
+    [InlineData("postgresql://vault_user:secret@host.example.com:invalid/mydb")]
+    [InlineData("postgresql://vault_user:secret@host.example.com:0/mydb")]
+    [InlineData("postgresql://vault_user:secret@host.example.com:70000/mydb")]
+    [InlineData("postgresql://vault_user:secret@host.example.com:-5/mydb")]
+    public void ParseDatabaseUrl_InvalidPort_ThrowsArgumentException(string url)
+    {
+        // Act
+        var act = () => Program.ParseDatabaseUrlToNpgsql(url);
+
+        // Assert
+        act.Should().Throw<ArgumentException>()
+            .WithMessage("*port*");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_MalformedPercentEscapeInDatabase_ThrowsArgumentException()
+    {
+        // Arrange — invalid percent escape in database name
+        var url = "postgresql://vault_user:secret@host.example.com:5432/my%ZZdb";
+
+        // Act
+        var act = () => Program.ParseDatabaseUrlToNpgsql(url);
+
+        // Assert
+        act.Should().Throw<ArgumentException>()
+            .WithMessage("*percent escape*");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_Production_SslModeDisable_ThrowsSecurityException()
+    {
+        // Arrange — production connection string attempting to disable SSL
+        var url = "postgresql://vault_user:secret@aws-0-us-east-1.pooler.supabase.com:5432/mydb?sslmode=disable";
+
+        // Act
+        var act = () => Program.ParseDatabaseUrlToNpgsql(url, isProduction: true);
+
+        // Assert — in production, sslmode=disable must be blocked
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*Insecure SSL mode*");
+    }
+
+    [Theory]
+    [InlineData("postgresql://vault_user:secret@host.example.com:5432/mydb?sslmode=invalid")]
+    [InlineData("postgresql://vault_user:secret@host.example.com:5432/mydb?sslmode=")]
+    [InlineData("postgresql://vault_user:secret@host.example.com:5432/mydb?sslmode")]
+    public void ParseDatabaseUrl_MalformedSslMode_ThrowsArgumentException(string url)
+    {
+        // Act
+        var act = () => Program.ParseDatabaseUrlToNpgsql(url);
+
+        // Assert — malformed SSL modes must fail closed
+        act.Should().Throw<ArgumentException>()
+            .WithMessage("*sslmode*");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_Production_OmittedSslMode_EnforcesSslRequire()
+    {
+        // Arrange — production URI with no sslmode specified
+        var url = "postgresql://vault_user:secret@aws-0-us-east-1.pooler.supabase.com:5432/mydb";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url, isProduction: true);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert — production must enforce Require even when omitted from URI
+        parsed.SslMode.Should().Be(SslMode.Require);
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_Ipv4Host_ParsesCorrectly()
+    {
+        // Arrange — IPv4 host address
+        var url = "postgresql://vault_user:secret@192.168.1.100:5432/mydb";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("192.168.1.100");
+        parsed.Port.Should().Be(5432);
+        parsed.Username.Should().Be("vault_user");
+        parsed.Password.Should().Be("secret");
+    }
+
+    [Fact]
+    public void ParseDatabaseUrl_EmptyCredentials_ProducesValidConnectionStringWithoutUsernameOrPassword()
+    {
+        // Arrange — empty credentials authority (e.g. peer / IAM auth)
+        var url = "postgresql://@host.example.com:5432/mydb";
+
+        // Act
+        var connStr = Program.ParseDatabaseUrlToNpgsql(url);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        parsed.Host.Should().Be("host.example.com");
+        parsed.Database.Should().Be("mydb");
+        parsed.Username.Should().BeNullOrEmpty();
+        parsed.Password.Should().BeNullOrEmpty();
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_DatabaseUrl_WithHashInPassword_ResolvesSuccessfully()
+    {
+        // Arrange — Render production scenario where DATABASE_URL contains unencoded '#' in password
+        var rawUrl = "postgresql://postgres.glstabcxyz:Synthetic#Pass2026!@aws-0-us-east-1.pooler.supabase.com:5432/postgres";
+        var config = new ConfigurationBuilder().Build();
+
+        // Act
+        var (provider, connStr) = Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: rawUrl, isProduction: true);
+        var parsed = new NpgsqlConnectionStringBuilder(connStr);
+
+        // Assert
+        provider.Should().Be("PostgreSQL");
+        parsed.Host.Should().Be("aws-0-us-east-1.pooler.supabase.com");
+        parsed.Username.Should().Be("postgres.glstabcxyz");
+        parsed.Password.Should().Be("Synthetic#Pass2026!");
+        parsed.SslMode.Should().Be(SslMode.Require);
+    }
+
+
+
+    [Fact]
     public void ParseDatabaseUrl_MissingHost_Throws()
     {
         // Arrange — URI without a host component
@@ -519,5 +766,80 @@ public class ProductionConfigurationTests
         // Assert — fails with sanitized error, no secrets leaked
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*CRITICAL DATABASE CONFIGURATION ERROR*");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_Production_DevDefaultConnection_ThrowsSanitizedException()
+    {
+        // Arrange — Production with DatabaseProvider=PostgreSQL and DefaultConnection having dev localhost fallback
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "PostgreSQL",
+            ["ConnectionStrings:DefaultConnection"] = "Host=localhost;Port=5432;Database=trustvault_db;Username=postgres;Password=postgres;"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var act = () => Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: true);
+
+        // Assert — must reject the localhost dev string in production and throw
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*PostgreSQL*production*");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_Production_IpLoopback_ThrowsSanitizedException()
+    {
+        // Arrange — Production with 127.0.0.1 loopback host (not matching exact 'localhost' string)
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "PostgreSQL",
+            ["ConnectionStrings:DefaultConnection"] = "Host=127.0.0.1;Port=5432;Database=proddb;Username=produser;Password=prodpass;"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var act = () => Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: true);
+
+        // Assert — must reject 127.0.0.1 loopback in production
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*development or localhost*");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_Production_DevCredentialsOnRemoteHost_ThrowsSanitizedException()
+    {
+        // Arrange — Production with remote host but development default credentials (postgres:postgres)
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "PostgreSQL",
+            ["ConnectionStrings:DefaultConnection"] = "Host=aws-0-us-east-1.pooler.supabase.com;Port=5432;Database=postgres;Username=postgres;Password=postgres;"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var act = () => Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: true);
+
+        // Assert — must reject default dev credentials in production
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*development or localhost*");
+    }
+
+    [Fact]
+    public void ResolveDatabaseConfiguration_Production_ExplicitSqlite_ThrowsSanitizedException()
+    {
+        // Arrange — Production with explicit DatabaseProvider=Sqlite
+        var inMemory = new Dictionary<string, string?>
+        {
+            ["DatabaseProvider"] = "Sqlite"
+        };
+        var config = new ConfigurationBuilder().AddInMemoryCollection(inMemory).Build();
+
+        // Act
+        var act = () => Program.ResolveDatabaseConfiguration(config, rawDatabaseUrl: null, isProduction: true);
+
+        // Assert — SQLite is not permitted in production
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*SQLite is not permitted in production*");
     }
 }
