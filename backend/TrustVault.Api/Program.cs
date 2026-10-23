@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using Npgsql;
 using TrustVault.Api.Auth;
 using TrustVault.Api.Data;
 using TrustVault.Api.Middleware;
@@ -300,25 +301,116 @@ catch (Exception ex)
 
 app.Run();
 
-// Helper method to parse DATABASE_URL (in URI format) to Npgsql connection string format
-static string ParseDatabaseUrlToNpgsql(string databaseUrl)
+// Required for WebApplicationFactory and external integration/unit tests
+public partial class Program
 {
-    if (string.IsNullOrWhiteSpace(databaseUrl)) return databaseUrl;
-    if (!databaseUrl.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) &&
-        !databaseUrl.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+    /// <summary>
+    /// Converts a DATABASE_URL (URI or standard connection string) into a secure Npgsql connection string.
+    /// Uses NpgsqlConnectionStringBuilder to safely encode credentials, support colons/semicolons in passwords,
+    /// and configure SSL settings for Supabase, Render, and cloud PostgreSQL providers.
+    /// </summary>
+    public static string ParseDatabaseUrlToNpgsql(string databaseUrl)
     {
-        return databaseUrl;
+        if (string.IsNullOrWhiteSpace(databaseUrl)) return databaseUrl;
+
+        var trimmed = databaseUrl.Trim();
+        if (!trimmed.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) &&
+            !trimmed.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+        {
+            return databaseUrl;
+        }
+
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+        {
+            throw new ArgumentException("The provided DATABASE_URL is not a valid absolute URI.");
+        }
+
+        var builder = new NpgsqlConnectionStringBuilder();
+
+        if (string.IsNullOrWhiteSpace(uri.Host))
+        {
+            throw new ArgumentException("The provided DATABASE_URL URI must specify a valid host.");
+        }
+
+        builder.Host = uri.Host;
+
+        if (uri.Port > 0)
+        {
+            builder.Port = uri.Port;
+        }
+        else
+        {
+            builder.Port = 5432;
+        }
+
+        var database = uri.AbsolutePath.TrimStart('/');
+        if (!string.IsNullOrWhiteSpace(database))
+        {
+            builder.Database = Uri.UnescapeDataString(database);
+        }
+
+        var userInfo = uri.UserInfo;
+        if (!string.IsNullOrEmpty(userInfo))
+        {
+            var colonIndex = userInfo.IndexOf(':');
+            if (colonIndex >= 0)
+            {
+                builder.Username = Uri.UnescapeDataString(userInfo.Substring(0, colonIndex));
+                builder.Password = Uri.UnescapeDataString(userInfo.Substring(colonIndex + 1));
+            }
+            else
+            {
+                builder.Username = Uri.UnescapeDataString(userInfo);
+            }
+        }
+
+        // Default SSL configuration: Require encrypted connections to cloud PostgreSQL providers.
+        // Supabase, Render, Neon, and Railway all require SSL for external connections.
+        builder.SslMode = SslMode.Require;
+
+        // Parse supported query parameters if present (e.g. ?sslmode=require&pooling=true).
+        // Only an explicit allowlist of safe parameters is accepted; unknown parameters are
+        // silently ignored to prevent URI query strings from changing security behavior.
+        if (!string.IsNullOrEmpty(uri.Query))
+        {
+            var query = uri.Query.TrimStart('?');
+            var pairs = query.Split('&', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var pair in pairs)
+            {
+                var eqIndex = pair.IndexOf('=');
+                if (eqIndex > 0)
+                {
+                    var key = Uri.UnescapeDataString(pair.Substring(0, eqIndex)).Trim();
+                    var val = Uri.UnescapeDataString(pair.Substring(eqIndex + 1)).Trim();
+
+                    if (key.Equals("sslmode", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (Enum.TryParse<SslMode>(val, true, out var parsedMode))
+                        {
+                            builder.SslMode = parsedMode;
+                        }
+                    }
+                    else if (key.Equals("channel_binding", StringComparison.OrdinalIgnoreCase) ||
+                             key.Equals("channelbinding", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (Enum.TryParse<ChannelBinding>(val, true, out var channelBinding))
+                        {
+                            builder.ChannelBinding = channelBinding;
+                        }
+                    }
+                    else if (key.Equals("pooling", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (bool.TryParse(val, out var pooling))
+                        {
+                            builder.Pooling = pooling;
+                        }
+                    }
+                    // All other query parameters are silently ignored to prevent
+                    // unrecognized keys from altering connection security settings.
+                }
+            }
+        }
+
+        return builder.ConnectionString;
     }
-
-    var uri = new Uri(databaseUrl);
-    var userInfo = uri.UserInfo.Split(':');
-    var username = userInfo.Length > 0 ? Uri.UnescapeDataString(userInfo[0]) : "";
-    var password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
-    var port = uri.Port > 0 ? uri.Port : 5432;
-    var database = uri.AbsolutePath.TrimStart('/');
-
-    return $"Host={uri.Host};Port={port};Database={database};Username={username};Password={password};SSL Mode=Require;Trust Server Certificate=true;";
 }
-
-// Required for WebApplicationFactory in integration tests
-public partial class Program { }
