@@ -87,31 +87,16 @@ export const UploadView: React.FC<UploadViewProps> = ({
     setFormError(null);
 
     try {
-      const reader = new FileReader();
-      reader.onload = async () => {
-        try {
-          const rawBase64 = (reader.result as string).split(',')[1];
-          await api.createDocument(
-            title.trim(),
-            selectedFile.name,
-            selectedFile.type || 'application/octet-stream',
-            rawBase64
-          );
-          onUploadSuccess(`Document "${title.trim()}" successfully encrypted and vaulted.`);
-          setTitle('');
-          setSelectedFile(null);
-          if (fileInputRef.current) {
-            fileInputRef.current.value = '';
-          }
-        } catch (uploadErr: any) {
-          onError(uploadErr.message || 'Failed to deposit document.');
-        } finally {
-          setUploading(false);
-        }
-      };
-      reader.readAsDataURL(selectedFile);
-    } catch {
-      onError('An error occurred reading the binary file stream.');
+      await api.uploadDocument(selectedFile, title.trim());
+      onUploadSuccess(`Document "${title.trim()}" successfully encrypted and vaulted.`);
+      setTitle('');
+      setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    } catch (uploadErr: any) {
+      onError(uploadErr.message || 'Failed to deposit document.');
+    } finally {
       setUploading(false);
     }
   };

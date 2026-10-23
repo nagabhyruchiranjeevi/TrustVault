@@ -19,19 +19,75 @@ public interface IDocumentStorageService
 public class LocalSecureFileStorageService : IDocumentStorageService
 {
     private readonly string _storageDirectory;
+    private readonly string? _fallbackDirectory;
     private readonly ILogger<LocalSecureFileStorageService> _logger;
 
     public LocalSecureFileStorageService(IConfiguration configuration, IWebHostEnvironment environment, ILogger<LocalSecureFileStorageService> logger)
     {
         _logger = logger;
-        var configuredPath = configuration["Storage:LocalVaultPath"] ?? "SecureVaultStorage";
-        _storageDirectory = Path.IsPathRooted(configuredPath)
+        var configuredPath = configuration["Storage:LocalVaultPath"]
+            ?? Environment.GetEnvironmentVariable("STORAGE_LOCAL_VAULT_PATH")
+            ?? "storage";
+
+        var targetPath = Path.IsPathRooted(configuredPath)
             ? configuredPath
             : Path.Combine(environment.ContentRootPath, configuredPath);
 
-        if (!Directory.Exists(_storageDirectory))
+        (_storageDirectory, _fallbackDirectory) = ResolveStorageDirectories(targetPath, environment.ContentRootPath, logger);
+    }
+
+    private static (string Primary, string? Fallback) ResolveStorageDirectories(string preferredPath, string contentRootPath, ILogger logger)
+    {
+        // 1. Try preferred path
+        if (TryEnsureDirectoryWritable(preferredPath, out var err1))
         {
-            Directory.CreateDirectory(_storageDirectory);
+            return (preferredPath, null);
+        }
+
+        logger.LogWarning(
+            "Configured local storage directory '{Path}' is not writable ({Error}). Attempting fallback storage locations.",
+            preferredPath, err1);
+
+        // 2. Try container storage directory (/app/storage) pre-created for non-root containers in Dockerfile
+        var containerStorage = Path.Combine(contentRootPath, "storage");
+        if (TryEnsureDirectoryWritable(containerStorage, out var err2))
+        {
+            logger.LogInformation("Active storage provider: Local filesystem at '{Path}'. Note: Container storage is ephemeral on cloud hosts like Render.", containerStorage);
+            return (containerStorage, preferredPath);
+        }
+
+        // 3. Fallback to system temporary directory
+        var tempStorage = Path.Combine(Path.GetTempPath(), "TrustVaultStorage");
+        if (TryEnsureDirectoryWritable(tempStorage, out var err3))
+        {
+            logger.LogWarning("Active storage provider: Local temporary directory at '{Path}'. Note: Storage is ephemeral and not durable across restarts.", tempStorage);
+            return (tempStorage, preferredPath);
+        }
+
+        throw new InvalidOperationException(
+            $"Cannot initialize local storage: neither '{preferredPath}', '{containerStorage}', nor '{tempStorage}' is writable.");
+    }
+
+    private static bool TryEnsureDirectoryWritable(string path, out string? error)
+    {
+        try
+        {
+            if (!Directory.Exists(path))
+            {
+                Directory.CreateDirectory(path);
+            }
+
+            var probeFile = Path.Combine(path, $".probe_{Guid.NewGuid():N}.tmp");
+            File.WriteAllText(probeFile, "probe");
+            File.Delete(probeFile);
+
+            error = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
         }
     }
 
@@ -59,9 +115,26 @@ public class LocalSecureFileStorageService : IDocumentStorageService
         var safeKey = Path.GetFileName(storageKey);
         var targetPath = Path.Combine(_storageDirectory, safeKey);
 
+        if (!File.Exists(targetPath) && _fallbackDirectory != null)
+        {
+            var fallbackPath = Path.Combine(_fallbackDirectory, safeKey);
+            if (File.Exists(fallbackPath))
+            {
+                targetPath = fallbackPath;
+            }
+        }
+
         if (!File.Exists(targetPath))
         {
-            throw new FileNotFoundException("Requested secure document binary could not be found.");
+            var tempPath = Path.Combine(Path.GetTempPath(), "TrustVaultStorage", safeKey);
+            if (File.Exists(tempPath))
+            {
+                targetPath = tempPath;
+            }
+            else
+            {
+                throw new FileNotFoundException("Requested secure document binary could not be found.");
+            }
         }
 
         Stream stream = new FileStream(targetPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
@@ -85,6 +158,15 @@ public class LocalSecureFileStorageService : IDocumentStorageService
         {
             File.Delete(targetPath);
             _logger.LogInformation("Secure storage file deleted: {Key}", safeKey);
+        }
+        else if (_fallbackDirectory != null)
+        {
+            var fallbackPath = Path.Combine(_fallbackDirectory, safeKey);
+            if (File.Exists(fallbackPath))
+            {
+                File.Delete(fallbackPath);
+                _logger.LogInformation("Secure storage fallback file deleted: {Key}", safeKey);
+            }
         }
 
         return Task.CompletedTask;

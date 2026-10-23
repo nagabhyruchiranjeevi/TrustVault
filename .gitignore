@@ -37,6 +37,8 @@ coverage/
 # Database / Local storage
 database/data/
 uploads/
+storage/
+**/storage/
 storage/temp/
 *.db           # SQLite dev databases — never commit real data
 **/*.db

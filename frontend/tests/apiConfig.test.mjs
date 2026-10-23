@@ -202,6 +202,7 @@ describe('TrustVault Frontend API Configuration Tests', () => {
 
     it('resolves document and audit endpoints cleanly', () => {
       assert.equal(`${baseUrl}/documents`, 'https://trustvault-glst.onrender.com/api/documents');
+      assert.equal(`${baseUrl}/documents/upload`, 'https://trustvault-glst.onrender.com/api/documents/upload');
       assert.equal(`${baseUrl}/audit`, 'https://trustvault-glst.onrender.com/api/audit');
     });
   });

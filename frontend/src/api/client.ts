@@ -23,8 +23,9 @@ class ApiClient {
   }
 
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData;
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
+      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
       ...(options.headers as Record<string, string>),
     };
 
@@ -41,7 +42,15 @@ class ApiClient {
       let errorMessage = `Request failed with status ${response.status}`;
       try {
         const errorData = await response.json();
-        if (errorData.detail) {
+        const validationErrors = errorData.errors || errorData.extensions?.errors;
+        if (validationErrors && typeof validationErrors === 'object') {
+          const messages = Object.values(validationErrors).flat().filter(Boolean);
+          if (messages.length > 0) {
+            errorMessage = messages.join(' ');
+          } else if (errorData.detail) {
+            errorMessage = errorData.detail;
+          }
+        } else if (errorData.detail) {
           errorMessage = errorData.detail;
         } else if (errorData.message || errorData.Message) {
           errorMessage = errorData.message || errorData.Message;
@@ -49,7 +58,15 @@ class ApiClient {
           errorMessage = errorData.title;
         }
       } catch {
-        // Fallback to text or status
+        if (response.status === 413) {
+          errorMessage = 'File exceeds the maximum allowed size (15 MB).';
+        } else if (response.status === 403) {
+          errorMessage = 'Access Denied (403): You do not have permission to perform this action.';
+        } else if (response.status === 401) {
+          errorMessage = 'Authentication expired. Please sign in again.';
+        } else if (response.status >= 500) {
+          errorMessage = 'A server error occurred. Please try again later.';
+        }
       }
       throw new Error(errorMessage);
     }
@@ -100,6 +117,17 @@ class ApiClient {
 
   async searchDocuments(query: string): Promise<DocumentItem[]> {
     return this.request<DocumentItem[]>(`/documents/search?query=${encodeURIComponent(query)}`);
+  }
+
+  async uploadDocument(file: File, title: string): Promise<DocumentItem> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('title', title);
+
+    return this.request<DocumentItem>('/documents/upload', {
+      method: 'POST',
+      body: formData,
+    });
   }
 
   async createDocument(title: string, fileName: string, contentType: string, base64Content: string): Promise<DocumentItem> {

@@ -243,6 +243,44 @@ public class SecurityRequirementsTests : IDisposable
     }
 
     [Fact]
+    public async Task LocalStorageService_FallsBackToWritableDirectory_WhenPreferredDirectoryIsUnwritable()
+    {
+        // Arrange - supply an invalid/unwritable preferred path
+        var invalidPath = Path.Combine(Path.GetPathRoot(Environment.SystemDirectory)!, "NonExistent_Unwritable_Dir_77e69642", "vault");
+        var tempRoot = Path.Combine(Path.GetTempPath(), "TrustVaultFallbackTest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempRoot);
+
+        try
+        {
+            var configMock = new Mock<Microsoft.Extensions.Configuration.IConfiguration>();
+            configMock.Setup(c => c["Storage:LocalVaultPath"]).Returns(invalidPath);
+
+            var envMock = new Mock<Microsoft.AspNetCore.Hosting.IWebHostEnvironment>();
+            envMock.Setup(e => e.ContentRootPath).Returns(tempRoot);
+
+            var loggerMock = new Mock<ILogger<LocalSecureFileStorageService>>();
+            var storageService = new LocalSecureFileStorageService(configMock.Object, envMock.Object, loggerMock.Object);
+
+            var sampleContent = "Fallback storage payload"u8.ToArray();
+
+            // Act
+            var key = await storageService.SaveDocumentAsync(sampleContent, "document.pdf", "application/pdf");
+
+            // Assert
+            key.Should().EndWith(".vault");
+            var storedBytes = await storageService.GetDocumentBytesAsync(key);
+            storedBytes.Should().Equal(sampleContent);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, true);
+            }
+        }
+    }
+
+    [Fact]
     public async Task Unauthorized_User_Cannot_Grant_Or_Revoke_Permissions()
     {
         // Arrange - User A owns doc; User B attempts to grant permission to User C
