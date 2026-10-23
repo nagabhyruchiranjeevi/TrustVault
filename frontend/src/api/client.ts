@@ -1,6 +1,6 @@
 import type { AuthResponse, DocumentItem, HealthCheckResponse, User, AuditEventItem, DocumentPermissionItem, AuditVerificationResult } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5115/api';
+import { API_BASE_URL } from './config';
 
 class ApiClient {
   private token: string | null = null;
