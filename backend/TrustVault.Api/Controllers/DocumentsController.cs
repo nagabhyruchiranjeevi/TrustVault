@@ -148,7 +148,18 @@ public class DocumentsController : ControllerBase
             return Forbid();
         }
 
-        var fileStream = await _storageService.GetDocumentStreamAsync(document.StorageKey);
+        Stream fileStream;
+        try
+        {
+            fileStream = await _storageService.GetDocumentStreamAsync(document.StorageKey);
+        }
+        catch (FileNotFoundException ex)
+        {
+            await _auditService.LogEventAsync(CurrentUserId, "DownloadDocumentFailed", "Document", id.ToString(),
+                $"Document binary missing from storage: {ex.Message}", "NotFound", ClientIp, CorrelationId);
+            return NotFound(new { Message = "The requested document file could not be found in storage." });
+        }
+
         await _auditService.LogEventAsync(CurrentUserId, "DownloadDocument", "Document", id.ToString(),
             $"Downloaded {document.FileName}", "Success", ClientIp, CorrelationId);
 
@@ -376,19 +387,40 @@ public class DocumentsController : ControllerBase
             return Forbid();
         }
 
-        document.IsDeleted = true;
-        document.UpdatedAtUtc = DateTime.UtcNow;
-
-        await _dbContext.SaveChangesAsync();
-
-        // Best-effort binary cleanup — soft-delete first so record is preserved for audit.
-        // We intentionally do NOT await a crash here: if storage delete fails, the record is
-        // already soft-deleted and the binary becomes inaccessible through the API.
-        _ = Task.Run(async () =>
+        // Delete from storage first. If storage delete fails, abort to avoid partial deletion state.
+        try
         {
-            try { await _storageService.DeleteDocumentAsync(document.StorageKey); }
-            catch (Exception) { /* storage cleanup failures are non-fatal */ }
-        });
+            await _storageService.DeleteDocumentAsync(document.StorageKey);
+        }
+        catch (Exception ex)
+        {
+            await _auditService.LogEventAsync(CurrentUserId, "DeleteDocumentFailed", "Document", id.ToString(),
+                $"Storage deletion failed for '{document.Title}': {ex.Message}", "Failure", ClientIp, CorrelationId);
+
+            return StatusCode(StatusCodes.Status500InternalServerError, new
+            {
+                Message = "Failed to completely delete document binary from storage. Deletion aborted."
+            });
+        }
+
+        try
+        {
+            document.IsDeleted = true;
+            document.UpdatedAtUtc = DateTime.UtcNow;
+
+            await _dbContext.SaveChangesAsync();
+        }
+        catch (Exception dbEx)
+        {
+            await _auditService.LogEventAsync(CurrentUserId, "DeleteDocumentStateMismatch", "Document", id.ToString(),
+                $"Storage binary was deleted but database update failed for '{document.Title}': {dbEx.Message}. Retrying delete operation will synchronize state.",
+                "Failure", ClientIp, CorrelationId);
+
+            return StatusCode(StatusCodes.Status500InternalServerError, new
+            {
+                Message = "Document binary was removed from storage, but updating document status in the database failed. Please retry the delete request to synchronize state."
+            });
+        }
 
         await _auditService.LogEventAsync(CurrentUserId, "DeleteDocument", "Document", id.ToString(),
             $"Document '{document.Title}' ({document.FileName}) soft-deleted", "Success", ClientIp, CorrelationId);

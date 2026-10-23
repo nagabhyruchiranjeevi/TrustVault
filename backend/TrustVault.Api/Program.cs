@@ -126,22 +126,39 @@ builder.Services.AddScoped<IAuthorizationHandler, DocumentAuthorizationHandler>(
 builder.Services.AddScoped<ITokenService, TokenService>();
 builder.Services.AddScoped<IAuditService, AuditService>();
 
-var storageProvider = builder.Configuration["Storage:Provider"] ?? "Local";
+ValidateStorageConfiguration(builder.Configuration, isProduction);
+
+var storageProvider = builder.Configuration["Storage:Provider"]
+    ?? Environment.GetEnvironmentVariable("STORAGE_PROVIDER")
+    ?? "Local";
+
 if (storageProvider.Equals("S3", StringComparison.OrdinalIgnoreCase))
 {
     builder.Services.AddSingleton<Amazon.S3.IAmazonS3>(sp =>
     {
         var config = sp.GetRequiredService<IConfiguration>();
-        var serviceUrl = config["Storage:S3ServiceUrl"] ?? Environment.GetEnvironmentVariable("STORAGE_S3_SERVICE_URL");
-        var region = config["Storage:S3Region"] ?? Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1";
-        var accessKey = config["Storage:S3AccessKey"] ?? Environment.GetEnvironmentVariable("AWS_ACCESS_KEY_ID");
-        var secretKey = config["Storage:S3SecretKey"] ?? Environment.GetEnvironmentVariable("AWS_SECRET_ACCESS_KEY");
+        var serviceUrl = config["Storage:S3ServiceUrl"]
+            ?? Environment.GetEnvironmentVariable("STORAGE_S3_SERVICE_URL");
+        var region = config["Storage:S3Region"]
+            ?? Environment.GetEnvironmentVariable("AWS_REGION")
+            ?? Environment.GetEnvironmentVariable("AWS_DEFAULT_REGION")
+            ?? "us-east-1";
+        var accessKey = config["Storage:S3AccessKey"]
+            ?? Environment.GetEnvironmentVariable("AWS_ACCESS_KEY_ID")
+            ?? config["AWS_ACCESS_KEY_ID"];
+        var secretKey = config["Storage:S3SecretKey"]
+            ?? Environment.GetEnvironmentVariable("AWS_SECRET_ACCESS_KEY")
+            ?? config["AWS_SECRET_ACCESS_KEY"];
 
         var s3Config = new Amazon.S3.AmazonS3Config();
         if (!string.IsNullOrEmpty(serviceUrl))
         {
             s3Config.ServiceURL = serviceUrl;
             s3Config.ForcePathStyle = true; // Required for S3-compatible endpoints (Cloudflare R2, MinIO, Supabase)
+            if (!string.IsNullOrWhiteSpace(region))
+            {
+                s3Config.AuthenticationRegion = region;
+            }
         }
         else
         {
@@ -854,4 +871,80 @@ public partial class Program
     private static bool IsHex(char c) =>
         (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 
+    /// <summary>
+    /// Validates storage provider configuration during startup.
+    /// Ensures that when remote S3/Supabase storage is configured, all required settings (bucket name, credentials, service URL)
+    /// are properly specified and valid. Never logs or leaks credentials.
+    /// </summary>
+    public static void ValidateStorageConfiguration(IConfiguration configuration, bool isProduction = false)
+    {
+        var provider = configuration["Storage:Provider"]
+            ?? Environment.GetEnvironmentVariable("STORAGE_PROVIDER")
+            ?? "Local";
+
+        if (provider.Equals("S3", StringComparison.OrdinalIgnoreCase))
+        {
+            var bucketName = configuration["Storage:S3BucketName"]
+                ?? Environment.GetEnvironmentVariable("STORAGE_S3_BUCKET_NAME");
+            if (string.IsNullOrWhiteSpace(bucketName))
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL STORAGE CONFIGURATION ERROR: When Storage:Provider is set to 'S3', " +
+                    "'Storage:S3BucketName' (or 'Storage__S3BucketName') must be configured.");
+            }
+
+            var accessKey = configuration["Storage:S3AccessKey"]
+                ?? Environment.GetEnvironmentVariable("AWS_ACCESS_KEY_ID")
+                ?? configuration["AWS_ACCESS_KEY_ID"];
+            var secretKey = configuration["Storage:S3SecretKey"]
+                ?? Environment.GetEnvironmentVariable("AWS_SECRET_ACCESS_KEY")
+                ?? configuration["AWS_SECRET_ACCESS_KEY"];
+
+            if (string.IsNullOrWhiteSpace(accessKey) || string.IsNullOrWhiteSpace(secretKey))
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL STORAGE CONFIGURATION ERROR: S3 storage provider is configured, but access credentials are missing. " +
+                    "Set 'AWS_ACCESS_KEY_ID' (or 'Storage:S3AccessKey') and 'AWS_SECRET_ACCESS_KEY' (or 'Storage:S3SecretKey').");
+            }
+
+            var serviceUrl = configuration["Storage:S3ServiceUrl"]
+                ?? Environment.GetEnvironmentVariable("STORAGE_S3_SERVICE_URL");
+            if (string.IsNullOrWhiteSpace(serviceUrl))
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL STORAGE CONFIGURATION ERROR: When Storage:Provider is set to 'S3', " +
+                    "'Storage:S3ServiceUrl' (or 'Storage__S3ServiceUrl') must be configured with a valid S3 endpoint URL.");
+            }
+
+            if (!Uri.TryCreate(serviceUrl, UriKind.Absolute, out var uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL STORAGE CONFIGURATION ERROR: 'Storage:S3ServiceUrl' must be a valid absolute HTTP or HTTPS URL.");
+            }
+
+            if (isProduction && (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                                uri.Host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                                uri.Host.Equals("::1", StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL STORAGE CONFIGURATION ERROR: S3 service endpoint cannot target localhost or loopback in production.");
+            }
+
+            var region = configuration["Storage:S3Region"]
+                ?? Environment.GetEnvironmentVariable("AWS_REGION")
+                ?? Environment.GetEnvironmentVariable("AWS_DEFAULT_REGION");
+            if (string.IsNullOrWhiteSpace(region))
+            {
+                throw new InvalidOperationException(
+                    "CRITICAL STORAGE CONFIGURATION ERROR: When Storage:Provider is set to 'S3', " +
+                    "an explicit S3 signing region ('Storage:S3Region', 'Storage__S3Region', or 'AWS_REGION') must be configured to match your Supabase project region.");
+            }
+        }
+        else if (!provider.Equals("Local", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"CRITICAL STORAGE CONFIGURATION ERROR: Unsupported storage provider '{provider}'. Supported providers are 'Local' and 'S3'.");
+        }
+    }
 }

@@ -182,13 +182,32 @@ public class S3DocumentStorageService : IDocumentStorageService
 {
     private readonly IAmazonS3 _s3Client;
     private readonly string _bucketName;
+    private readonly bool _enableServerSideEncryption;
+    private readonly string? _legacyLocalDirectory;
     private readonly ILogger<S3DocumentStorageService> _logger;
 
-    public S3DocumentStorageService(IAmazonS3 s3Client, IConfiguration configuration, ILogger<S3DocumentStorageService> logger)
+    public S3DocumentStorageService(
+        IAmazonS3 s3Client,
+        IConfiguration configuration,
+        IWebHostEnvironment environment,
+        ILogger<S3DocumentStorageService> logger)
     {
         _s3Client = s3Client;
         _logger = logger;
-        _bucketName = configuration["Storage:S3BucketName"] ?? "trustvault-private-vault";
+        _bucketName = configuration["Storage:S3BucketName"]
+            ?? Environment.GetEnvironmentVariable("STORAGE_S3_BUCKET_NAME")
+            ?? "trustvault-private-vault";
+
+        // Supabase Storage, Cloudflare R2, and MinIO do not accept AWS SSE headers.
+        // ServerSideEncryption is only enabled if explicitly configured.
+        _enableServerSideEncryption = configuration.GetValue<bool>("Storage:EnableS3ServerSideEncryption", false);
+
+        // Optional legacy fallback directory for reading existing local documents
+        var localPath = configuration["Storage:LocalVaultPath"]
+            ?? Environment.GetEnvironmentVariable("STORAGE_LOCAL_VAULT_PATH")
+            ?? "storage";
+        var resolvedLocal = Path.IsPathRooted(localPath) ? localPath : Path.Combine(environment.ContentRootPath, localPath);
+        _legacyLocalDirectory = Directory.Exists(resolvedLocal) ? resolvedLocal : null;
     }
 
     public async Task<string> SaveDocumentAsync(byte[] content, string originalFileName, string contentType, CancellationToken cancellationToken = default)
@@ -206,14 +225,31 @@ public class S3DocumentStorageService : IDocumentStorageService
             BucketName = _bucketName,
             Key = safeKey,
             InputStream = contentStream,
-            ContentType = string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType,
-            ServerSideEncryptionMethod = ServerSideEncryptionMethod.AES256 // At-rest S3 encryption
+            ContentType = string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType
         };
+
+        if (_enableServerSideEncryption)
+        {
+            putRequest.ServerSideEncryptionMethod = ServerSideEncryptionMethod.AES256;
+        }
 
         await _s3Client.PutObjectAsync(putRequest, cancellationToken);
         _logger.LogInformation("Stored document in private S3 bucket {Bucket} with key {Key}", _bucketName, safeKey);
 
         return safeKey;
+    }
+
+    /// <summary>
+    /// Positively determines whether a storage key represents a legacy local-only document.
+    /// Remote S3/Supabase storage objects are strictly namespaced under 'vault-docs/' (e.g. 'vault-docs/{guid}.vault').
+    /// Legacy local documents are flat filenames without directories (e.g. '{guid}.vault').
+    /// </summary>
+    public static bool IsLegacyLocalKey(string storageKey)
+    {
+        if (string.IsNullOrWhiteSpace(storageKey)) return false;
+        return !storageKey.StartsWith("vault-docs/", StringComparison.OrdinalIgnoreCase) &&
+               !storageKey.Contains('/') &&
+               !storageKey.Contains('\\');
     }
 
     public async Task<Stream> GetDocumentStreamAsync(string storageKey, CancellationToken cancellationToken = default)
@@ -229,9 +265,24 @@ public class S3DocumentStorageService : IDocumentStorageService
             var response = await _s3Client.GetObjectAsync(getRequest, cancellationToken);
             return response.ResponseStream;
         }
-        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound || ex.ErrorCode == "NoSuchKey")
         {
-            throw new FileNotFoundException($"Object {storageKey} not found in S3 bucket {_bucketName}.", ex);
+            // Fall back to legacy local directory ONLY if this key is positively established as a legacy local-only document.
+            // Network outages, timeouts, and auth errors propagate as exceptions and never fall back to local disk.
+            // S3-namespaced documents ('vault-docs/*') are never served from local disk even on 404.
+            if (IsLegacyLocalKey(storageKey) && _legacyLocalDirectory != null)
+            {
+                var safeKey = Path.GetFileName(storageKey);
+                var localPath = Path.Combine(_legacyLocalDirectory, safeKey);
+                if (File.Exists(localPath))
+                {
+                    _logger.LogInformation("Serving verified legacy document from local storage for key {Key}", safeKey);
+                    Stream stream = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
+                    return stream;
+                }
+            }
+
+            throw new FileNotFoundException($"Object '{storageKey}' not found in remote storage bucket '{_bucketName}'.", ex);
         }
     }
 
@@ -245,6 +296,7 @@ public class S3DocumentStorageService : IDocumentStorageService
 
     public async Task DeleteDocumentAsync(string storageKey, CancellationToken cancellationToken = default)
     {
+        // 1. Delete from remote S3/Supabase storage. If the remote delete fails, do NOT swallow the error.
         var deleteRequest = new DeleteObjectRequest
         {
             BucketName = _bucketName,
@@ -253,5 +305,17 @@ public class S3DocumentStorageService : IDocumentStorageService
 
         await _s3Client.DeleteObjectAsync(deleteRequest, cancellationToken);
         _logger.LogInformation("Deleted document from private S3 bucket {Bucket} with key {Key}", _bucketName, storageKey);
+
+        // 2. Clean up legacy local file if it existed. Do not silently swallow local delete errors.
+        if (_legacyLocalDirectory != null)
+        {
+            var safeKey = Path.GetFileName(storageKey);
+            var localPath = Path.Combine(_legacyLocalDirectory, safeKey);
+            if (File.Exists(localPath))
+            {
+                File.Delete(localPath);
+                _logger.LogInformation("Deleted legacy local file for key {Key}", safeKey);
+            }
+        }
     }
 }
