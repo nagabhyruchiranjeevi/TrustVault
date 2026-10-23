@@ -1033,6 +1033,1476 @@ public class RemoteStorageTests : IDisposable
             "audit-missing-download"), Times.Once);
     }
 
+    // ──────────────────────────────────────────────────────────
+    // 4. Legacy Document Migration Tests
+    // ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task MigrateLegacyDocument_Success_UploadsToS3_VerifiesReadBack_AndUpdatesStorageKey()
+    {
+        // Arrange — Legacy document with flat local key (e.g. "legacy-contract.vault")
+        var ownerId = Guid.NewGuid();
+        var legacyKey = "a1b2c3d4e5f678901234567890abcdef.vault";
+        var fileContent = new byte[] { 0x25, 0x50, 0x44, 0x46, 0x20, 0x31, 0x2e, 0x34 }; // %PDF 1.4
+        var expectedSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileContent)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Legacy Production Contract",
+            FileName = "contract.pdf",
+            ContentType = "application/pdf",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileContent.Length,
+            OwnerId = ownerId,
+            CreatedAtUtc = DateTime.UtcNow.AddMonths(-2),
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authOptions = Options.Create(new AuthorizationOptions());
+        var authLogger = new Mock<ILogger<DocumentAuthorizationHandler>>();
+        var authHandler = new DocumentAuthorizationHandler(_dbContext, authLogger.Object);
+        var handlers = new IAuthorizationHandler[] { authHandler };
+        var handlerProviderMock = new Mock<IAuthorizationHandlerProvider>();
+        handlerProviderMock.Setup(h => h.GetHandlersAsync(It.IsAny<AuthorizationHandlerContext>()))
+            .ReturnsAsync(handlers);
+        var handlerContextFactoryMock = new Mock<IAuthorizationHandlerContextFactory>();
+        handlerContextFactoryMock.Setup(f => f.CreateContext(It.IsAny<IEnumerable<IAuthorizationRequirement>>(), It.IsAny<ClaimsPrincipal>(), It.IsAny<object?>()))
+            .Returns<IEnumerable<IAuthorizationRequirement>, ClaimsPrincipal, object?>((reqs, u, res) =>
+                new AuthorizationHandlerContext(reqs, u, res));
+        var authService = new DefaultAuthorizationService(
+            new DefaultAuthorizationPolicyProvider(authOptions),
+            handlerProviderMock.Object,
+            new Mock<ILogger<DefaultAuthorizationService>>().Object,
+            handlerContextFactoryMock.Object,
+            new DefaultAuthorizationEvaluator(),
+            authOptions);
+
+        var newS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var storageMock = new Mock<IDocumentStorageService>();
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "contract.pdf", "application/pdf", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(newS3Key);
+
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(fileContent));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authService,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Email, "owner@vault.local"),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "audit-migrate-success"
+            }
+        };
+
+        using var stream = new MemoryStream(fileContent);
+        var formFile = new FormFile(stream, 0, fileContent.Length, "file", "contract.pdf")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "application/pdf"
+        };
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, expectedSha256);
+
+        // Assert — Returns 200 OK, StorageKey updated to new S3 key, audit logged
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        okResult.StatusCode.Should().Be(StatusCodes.Status200OK);
+
+        var updatedDoc = await _dbContext.Documents.AsNoTracking().FirstAsync(d => d.Id == doc.Id);
+        updatedDoc.StorageKey.Should().Be(newS3Key);
+        updatedDoc.StorageKey.Should().StartWith("vault-docs/");
+        updatedDoc.Title.Should().Be("Legacy Production Contract");
+        updatedDoc.FileName.Should().Be("contract.pdf");
+        updatedDoc.OwnerId.Should().Be(ownerId);
+        updatedDoc.UpdatedAtUtc.Should().NotBeNull();
+
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "contract.pdf", "application/pdf", It.IsAny<CancellationToken>()), Times.Once);
+        storageMock.Verify(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()), Times.Once,
+            "read-back verification must occur before database update");
+
+        _auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentStorage",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains("Successfully migrated document") && s.Contains(newS3Key)),
+            "Success",
+            It.IsAny<string?>(),
+            "audit-migrate-success"), Times.Once);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_Success_WhenAdminAuthorized_UploadsAndUpdatesStorageKey()
+    {
+        // Arrange — Admin migrating document owned by another user
+        var ownerId = Guid.NewGuid();
+        var adminId = Guid.NewGuid();
+        var legacyKey = "legacy-admin-test.vault";
+        var fileContent = new byte[] { 0x50, 0x4B, 0x03, 0x04 }; // ZIP/DOCX header
+        var expectedSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileContent)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Admin Migrated Report",
+            FileName = "report.docx",
+            ContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileContent.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var newS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var storageMock = new Mock<IDocumentStorageService>();
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "report.docx", doc.ContentType, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(newS3Key);
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(fileContent));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var adminClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, adminId.ToString()),
+            new(ClaimTypes.Email, "admin@vault.local"),
+            new(ClaimTypes.Role, Roles.Admin)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(adminClaims, "Bearer")),
+                TraceIdentifier = "audit-admin-migrate"
+            }
+        };
+
+        using var stream = new MemoryStream(fileContent);
+        var formFile = new FormFile(stream, 0, fileContent.Length, "file", "report.docx");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, expectedSha256);
+
+        // Assert — Admin authorization succeeds
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        okResult.StatusCode.Should().Be(StatusCodes.Status200OK);
+
+        var updatedDoc = await _dbContext.Documents.AsNoTracking().FirstAsync(d => d.Id == doc.Id);
+        updatedDoc.StorageKey.Should().Be(newS3Key);
+
+        _auditMock.Verify(a => a.LogEventAsync(
+            adminId,
+            "MigrateDocumentStorage",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains("Successfully migrated document") && s.Contains(newS3Key)),
+            "Success",
+            It.IsAny<string?>(),
+            "audit-admin-migrate"), Times.Once);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenCallerIsNonOwnerCollaboratorWithEdit_ReturnsForbid_AuditsDenied()
+    {
+        // Arrange — Collaborator who only has PermissionLevel.Edit is forbidden from migrating storage
+        var ownerId = Guid.NewGuid();
+        var collaboratorId = Guid.NewGuid();
+        var legacyKey = "collaborator-test.vault";
+        var fileBytes = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+        var expectedSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Shared Project",
+            FileName = "project.pdf",
+            ContentType = "application/pdf",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        doc.Permissions.Add(new DocumentPermission
+        {
+            DocumentId = doc.Id,
+            UserId = collaboratorId,
+            PermissionLevel = PermissionLevel.Edit
+        });
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var collaboratorClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, collaboratorId.ToString()),
+            new(ClaimTypes.Email, "collab@vault.local"),
+            new(ClaimTypes.Role, Roles.Viewer)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(collaboratorClaims, "Bearer")),
+                TraceIdentifier = "audit-collab-denied"
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "project.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, expectedSha256);
+
+        // Assert — 403 Forbid
+        result.Should().BeOfType<ForbidResult>();
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        _auditMock.Verify(a => a.LogEventAsync(
+            collaboratorId,
+            "MigrateDocumentDenied",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains("Storage migration denied")),
+            "Forbidden",
+            It.IsAny<string?>(),
+            "audit-collab-denied"), Times.Once);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenCallerUnauthorizedViewer_ReturnsForbid_AuditsDenied()
+    {
+        // Arrange
+        var ownerId = Guid.NewGuid();
+        var viewerId = Guid.NewGuid();
+        var fileBytes = new byte[] { 1, 2, 3 };
+        var expectedSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Confidential Strategy",
+            FileName = "strat.pdf",
+            ContentType = "application/pdf",
+            StorageKey = "local-key-123.vault",
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authOptions = Options.Create(new AuthorizationOptions());
+        var authLogger = new Mock<ILogger<DocumentAuthorizationHandler>>();
+        var authHandler = new DocumentAuthorizationHandler(_dbContext, authLogger.Object);
+        var handlers = new IAuthorizationHandler[] { authHandler };
+        var handlerProviderMock = new Mock<IAuthorizationHandlerProvider>();
+        handlerProviderMock.Setup(h => h.GetHandlersAsync(It.IsAny<AuthorizationHandlerContext>()))
+            .ReturnsAsync(handlers);
+        var handlerContextFactoryMock = new Mock<IAuthorizationHandlerContextFactory>();
+        handlerContextFactoryMock.Setup(f => f.CreateContext(It.IsAny<IEnumerable<IAuthorizationRequirement>>(), It.IsAny<ClaimsPrincipal>(), It.IsAny<object?>()))
+            .Returns<IEnumerable<IAuthorizationRequirement>, ClaimsPrincipal, object?>((reqs, u, res) =>
+                new AuthorizationHandlerContext(reqs, u, res));
+        var authService = new DefaultAuthorizationService(
+            new DefaultAuthorizationPolicyProvider(authOptions),
+            handlerProviderMock.Object,
+            new Mock<ILogger<DefaultAuthorizationService>>().Object,
+            handlerContextFactoryMock.Object,
+            new DefaultAuthorizationEvaluator(),
+            authOptions);
+
+        var storageMock = new Mock<IDocumentStorageService>();
+        var controller = new DocumentsController(
+            _dbContext,
+            authService,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var viewerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, viewerId.ToString()),
+            new(ClaimTypes.Email, "viewer@vault.local"),
+            new(ClaimTypes.Role, Roles.Viewer)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(viewerClaims, "Bearer")),
+                TraceIdentifier = "audit-migrate-deny"
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "strat.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, expectedSha256);
+
+        // Assert — 403 Forbid, storage never called, denial audited
+        result.Should().BeOfType<ForbidResult>();
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        _auditMock.Verify(a => a.LogEventAsync(
+            viewerId,
+            "MigrateDocumentDenied",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains("Storage migration denied")),
+            "Forbidden",
+            It.IsAny<string?>(),
+            "audit-migrate-deny"), Times.Once);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenExpectedSha256MissingOrWhitespace_ReturnsBadRequest()
+    {
+        // Arrange
+        var ownerId = Guid.NewGuid();
+        var fileBytes = new byte[] { 1, 2, 3, 4 };
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Missing Checksum Doc",
+            FileName = "missing_cs.pdf",
+            ContentType = "application/pdf",
+            StorageKey = "missing-cs.vault",
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer"))
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "missing_cs.pdf");
+
+        // Act — pass empty string
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, "   ");
+
+        // Assert — 400 BadRequest requiring expectedSha256
+        var badRequest = result.Should().BeOfType<BadRequestObjectResult>().Subject;
+        badRequest.Value?.ToString().Should().Contain("expectedSha256 is required");
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenExpectedSha256Not64HexCharacters_ReturnsBadRequest()
+    {
+        // Arrange
+        var ownerId = Guid.NewGuid();
+        var fileBytes = new byte[] { 1, 2, 3, 4 };
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Bad Hex Doc",
+            FileName = "bad_hex.pdf",
+            ContentType = "application/pdf",
+            StorageKey = "bad-hex.vault",
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer"))
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "bad_hex.pdf");
+
+        // Act — pass non-hex and invalid length strings
+        var resultTooShort = await controller.MigrateLegacyDocument(doc.Id, formFile, "abc1234");
+        var resultInvalidChars = await controller.MigrateLegacyDocument(doc.Id, formFile, new string('z', 64));
+
+        // Assert — 400 BadRequest requiring 64 hexadecimal characters
+        var badRequest1 = resultTooShort.Should().BeOfType<BadRequestObjectResult>().Subject;
+        badRequest1.Value?.ToString().Should().Contain("64 hexadecimal characters");
+
+        var badRequest2 = resultInvalidChars.Should().BeOfType<BadRequestObjectResult>().Subject;
+        badRequest2.Value?.ToString().Should().Contain("64 hexadecimal characters");
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenExpectedSha256ChecksumMismatches_ReturnsBadRequest()
+    {
+        // Arrange — Uploaded binary does not match the caller's expectedSha256
+        var ownerId = Guid.NewGuid();
+        var fileBytes = new byte[] { 1, 2, 3, 4, 5 };
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Checksum Test",
+            FileName = "check.pdf",
+            ContentType = "application/pdf",
+            StorageKey = "checksum-test.vault",
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer"))
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "check.pdf");
+
+        // Act — Pass a mismatched valid 64-char expected hash
+        var wrongExpectedHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, wrongExpectedHash);
+
+        // Assert — 400 BadRequest with checksum mismatch
+        var badRequest = result.Should().BeOfType<BadRequestObjectResult>().Subject;
+        badRequest.Value?.ToString().Should().Contain("Binary SHA-256 checksum mismatch");
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenFileSizeMismatchesDatabase_ReturnsBadRequest()
+    {
+        // Arrange — Document has registered size 100 bytes, but uploaded file is 4 bytes
+        var ownerId = Guid.NewGuid();
+        var uploadedBytes = new byte[] { 1, 2, 3, 4 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(uploadedBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Size Mismatch Test",
+            FileName = "doc.pdf",
+            ContentType = "application/pdf",
+            StorageKey = "local-size-test.vault",
+            FileSizeBytes = 100, // Expected 100 bytes
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer"))
+            }
+        };
+
+        using var stream = new MemoryStream(uploadedBytes);
+        var formFile = new FormFile(stream, 0, uploadedBytes.Length, "file", "doc.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert — 400 BadRequest with size mismatch message
+        var badRequest = result.Should().BeOfType<BadRequestObjectResult>().Subject;
+        badRequest.Value?.ToString().Should().Contain("File size mismatch");
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenFilenameMismatches_ReturnsBadRequest()
+    {
+        // Arrange
+        var ownerId = Guid.NewGuid();
+        var fileBytes = new byte[] { 1, 2, 3 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Registered Document",
+            FileName = "actual_name.pdf",
+            ContentType = "application/pdf",
+            StorageKey = "flat-key.vault",
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "audit-mismatch-filename"
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var wrongFile = new FormFile(stream, 0, fileBytes.Length, "file", "wrong_name.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, wrongFile, validHash);
+
+        // Assert — 400 BadRequest with explanatory message
+        var badRequest = result.Should().BeOfType<BadRequestObjectResult>().Subject;
+        badRequest.Value?.ToString().Should().Contain("does not match registered document file name");
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenReadBackVerificationFails_CleansUpRemote_LeavesDatabaseUntouched()
+    {
+        // Arrange
+        var ownerId = Guid.NewGuid();
+        var legacyKey = "legacy-to-verify.vault";
+        var fileBytes = new byte[] { 1, 2, 3, 4 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Corrupt Verify Test",
+            FileName = "verify.pdf",
+            ContentType = "application/pdf",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var newS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var storageMock = new Mock<IDocumentStorageService>();
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "verify.pdf", "application/pdf", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(newS3Key);
+
+        // Verification read-back throws FileNotFoundException or read failure
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new FileNotFoundException("Object vanished immediately after write"));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "audit-verify-fail"
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "verify.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert — Returns 500, cleans up new S3 object, leaves DB unchanged with legacyKey
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status500InternalServerError);
+
+        storageMock.Verify(s => s.DeleteDocumentAsync(newS3Key, It.IsAny<CancellationToken>()), Times.Once,
+            "failed verification must clean up unverified remote object");
+
+        var dbDoc = await _dbContext.Documents.AsNoTracking().FirstAsync(d => d.Id == doc.Id);
+        dbDoc.StorageKey.Should().Be(legacyKey, "database StorageKey must remain untouched on verification failure");
+
+        _auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentVerificationFailed",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains("Remote read-back verification failed")),
+            "Failure",
+            It.IsAny<string?>(),
+            "audit-verify-fail"), Times.Once);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenVerificationFails_AndCleanupThrows_LogsWarning_LeavesDatabaseUntouched()
+    {
+        // Arrange — Verification fails, and S3 cleanup throws (e.g. S3 network outage)
+        var ownerId = Guid.NewGuid();
+        var legacyKey = "cleanup-fail.vault";
+        var fileBytes = new byte[] { 10, 20, 30 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Cleanup Failure Test",
+            FileName = "cleanup.pdf",
+            ContentType = "application/pdf",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var newS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var storageMock = new Mock<IDocumentStorageService>();
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "cleanup.pdf", "application/pdf", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(newS3Key);
+
+        // Verification returns wrong bytes (hash mismatch)
+        var corruptedBytes = new byte[] { 99, 99, 99 };
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(corruptedBytes));
+
+        // DeleteDocumentAsync throws!
+        storageMock.Setup(s => s.DeleteDocumentAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new Amazon.S3.AmazonS3Exception("Connection dropped during cleanup"));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "audit-cleanup-warning"
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "cleanup.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert — Does not crash, returns 500, DB untouched, audits OrphanedStorageObjectWarning
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status500InternalServerError);
+
+        var dbDoc = await _dbContext.Documents.AsNoTracking().FirstAsync(d => d.Id == doc.Id);
+        dbDoc.StorageKey.Should().Be(legacyKey, "DB must remain untouched");
+
+        _auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "OrphanedStorageObjectWarning",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains("automated cleanup failed") && s.Contains(newS3Key)),
+            "Warning",
+            It.IsAny<string?>(),
+            "audit-cleanup-warning"), Times.Once);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenDatabaseSaveFails_CleansUpRemote_LeavesOldKeyInDatabase()
+    {
+        // Arrange — Storage upload and verification succeed, but EF Core SaveChangesAsync throws
+        var flakyOptions = new DbContextOptionsBuilder<ApplicationDbContext>()
+            .UseInMemoryDatabase(databaseName: $"FlakyMigrateDb_{Guid.NewGuid()}")
+            .Options;
+
+        using var flakyDb = new FlakyTestDbContext(flakyOptions);
+        var ownerId = Guid.NewGuid();
+        var legacyKey = "flaky-db.vault";
+        var fileBytes = new byte[] { 1, 2, 3, 4 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Flaky DB Document",
+            FileName = "flaky.pdf",
+            ContentType = "application/pdf",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        flakyDb.DisableFailure = true;
+        flakyDb.Documents.Add(doc);
+        await flakyDb.SaveChangesAsync();
+        flakyDb.DisableFailure = false; // Next SaveChangesAsync will throw
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var newS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var storageMock = new Mock<IDocumentStorageService>();
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "flaky.pdf", "application/pdf", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(newS3Key);
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(fileBytes));
+
+        var controller = new DocumentsController(
+            flakyDb,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "audit-db-fail"
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "flaky.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert — Returns 500, cleans up remote object, records audit
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status500InternalServerError);
+
+        storageMock.Verify(s => s.DeleteDocumentAsync(newS3Key, It.IsAny<CancellationToken>()), Times.Once,
+            "remote object must be cleaned up when DB save fails");
+
+        _auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentDatabaseFailed",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains("Database StorageKey update failed")),
+            "Failure",
+            It.IsAny<string?>(),
+            "audit-db-fail"), Times.Once);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenAlreadyMigrated_AndRemoteObjectVerified_ReturnsOk_DoesNotDuplicateAudit()
+    {
+        // Arrange — Document already has vault-docs/ key and object is verified in storage
+        var ownerId = Guid.NewGuid();
+        var existingS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var fileContent = new byte[] { 1, 2, 3, 4 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileContent)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Already Migrated File",
+            FileName = "already.pdf",
+            ContentType = "application/pdf",
+            StorageKey = existingS3Key,
+            FileSizeBytes = fileContent.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+
+        // Existing success audit event already committed in DB
+        _dbContext.AuditEvents.Add(new AuditEvent
+        {
+            Id = Guid.NewGuid(),
+            SequenceNumber = 1,
+            UserId = ownerId,
+            Action = "MigrateDocumentStorage",
+            EntityType = "Document",
+            EntityId = doc.Id.ToString(),
+            Status = "Success",
+            TimestampUtc = DateTime.UtcNow.AddMinutes(-5),
+            PreviousHash = AuditService.GenesisHash,
+            CurrentHash = "dummy-hash-1"
+        });
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        // Remote read-back verification succeeds
+        storageMock.Setup(s => s.GetDocumentStreamAsync(existingS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(fileContent));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Email, "owner@vault.local"),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "audit-already-migrated"
+            }
+        };
+
+        using var stream = new MemoryStream(fileContent);
+        var formFile = new FormFile(stream, 0, fileContent.Length, "file", "already.pdf");
+
+        // Act — Attempt migration again on already-migrated document
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert — Returns 200 OK with AlreadyMigrated: true, no storage upload attempted, NO duplicate audit event
+        var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
+        okResult.StatusCode.Should().Be(StatusCodes.Status200OK);
+        okResult.Value?.ToString().Should().Contain("AlreadyMigrated = True");
+
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        _auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentStorage",
+            It.IsAny<string>(),
+            It.IsAny<string?>(),
+            It.IsAny<string?>(),
+            It.IsAny<string>(),
+            It.IsAny<string?>(),
+            It.IsAny<string?>()), Times.Never, "idempotent retry must not create duplicate success audit events");
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenAlreadyMigrated_AndRemoteObjectMissing_Returns502_LeavesDatabaseUntouched()
+    {
+        // Arrange — Document has vault-docs/ key in DB, but object is missing in remote storage
+        var ownerId = Guid.NewGuid();
+        var missingS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var fileContent = new byte[] { 1, 2, 3, 4 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileContent)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Ghost Document",
+            FileName = "ghost.pdf",
+            ContentType = "application/pdf",
+            StorageKey = missingS3Key,
+            FileSizeBytes = fileContent.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        // Remote read-back throws FileNotFoundException
+        storageMock.Setup(s => s.GetDocumentStreamAsync(missingS3Key, It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new FileNotFoundException("Object missing in bucket"));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer"))
+            }
+        };
+
+        using var stream = new MemoryStream(fileContent);
+        var formFile = new FormFile(stream, 0, fileContent.Length, "file", "ghost.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert — Returns 502 Bad Gateway, does not re-upload or touch database
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never,
+            "must never silently re-upload over an unverified remote object key");
+
+        var dbDoc = await _dbContext.Documents.AsNoTracking().FirstAsync(d => d.Id == doc.Id);
+        dbDoc.StorageKey.Should().Be(missingS3Key, "database key must remain untouched");
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenAlreadyMigrated_AndStorageOutage_Returns502_LeavesDatabaseUntouched()
+    {
+        // Arrange — Document has vault-docs/ key in DB, but S3 storage suffers network outage
+        var ownerId = Guid.NewGuid();
+        var s3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var fileContent = new byte[] { 1, 2, 3, 4 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileContent)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Outage Document",
+            FileName = "outage.pdf",
+            ContentType = "application/pdf",
+            StorageKey = s3Key,
+            FileSizeBytes = fileContent.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var storageMock = new Mock<IDocumentStorageService>();
+        // Remote storage outage
+        storageMock.Setup(s => s.GetDocumentStreamAsync(s3Key, It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new Amazon.S3.AmazonS3Exception("Connection refused / timeout"));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer"))
+            }
+        };
+
+        using var stream = new MemoryStream(fileContent);
+        var formFile = new FormFile(stream, 0, fileContent.Length, "file", "outage.pdf");
+
+        // Act
+        var result = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert — Returns 502 Bad Gateway
+        var statusResult = result.Should().BeOfType<ObjectResult>().Subject;
+        statusResult.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_WhenAuditLoggingFailsAfterDbSave_CompletesMigrationSafely_AndRetryRecoversAuditWithoutDuplicate()
+    {
+        // Arrange — Storage update & DB save succeed, but audit log throws
+        var ownerId = Guid.NewGuid();
+        var legacyKey = "audit-fail-test.vault";
+        var fileBytes = new byte[] { 1, 2, 3, 4 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Audit Fail Doc",
+            FileName = "audit_fail.pdf",
+            ContentType = "application/pdf",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+        _dbContext.Documents.Add(doc);
+        await _dbContext.SaveChangesAsync();
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+        var newS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var storageMock = new Mock<IDocumentStorageService>();
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "audit_fail.pdf", "application/pdf", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(newS3Key);
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(fileBytes));
+
+        // Setup audit service to throw once on initial success log
+        _auditMock.Setup(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentStorage",
+            "Document",
+            doc.Id.ToString(),
+            It.IsAny<string?>(),
+            "Success",
+            It.IsAny<string?>(),
+            "audit-fail-trace"))
+            .ThrowsAsync(new InvalidOperationException("Audit store transient connection reset"));
+
+        var controller = new DocumentsController(
+            _dbContext,
+            authServiceMock.Object,
+            storageMock.Object,
+            _auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "audit-fail-trace"
+            }
+        };
+
+        using var stream = new MemoryStream(fileBytes);
+        var formFile = new FormFile(stream, 0, fileBytes.Length, "file", "audit_fail.pdf");
+
+        // Act 1 — Initial migration run
+        var result1 = await controller.MigrateLegacyDocument(doc.Id, formFile, validHash);
+
+        // Assert 1 — DB is updated to new S3 key and returns 200 OK
+        var okResult1 = result1.Should().BeOfType<OkObjectResult>().Subject;
+        okResult1.StatusCode.Should().Be(StatusCodes.Status200OK);
+
+        var dbDoc = await _dbContext.Documents.AsNoTracking().FirstAsync(d => d.Id == doc.Id);
+        dbDoc.StorageKey.Should().Be(newS3Key);
+
+        // Reset audit mock to succeed on subsequent retry
+        _auditMock.Reset();
+
+        // Setup storageMock to continue returning valid stream for newS3Key verification during retry
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(fileBytes));
+
+        // Act 2 — Caller retries migration request
+        using var stream2 = new MemoryStream(fileBytes);
+        var formFile2 = new FormFile(stream2, 0, fileBytes.Length, "file", "audit_fail.pdf");
+        controller.ControllerContext.HttpContext.TraceIdentifier = "audit-retry-trace";
+
+        var result2 = await controller.MigrateLegacyDocument(doc.Id, formFile2, validHash);
+
+        // Assert 2 — Idempotent check succeeds, logs the missing audit event, returns 200 OK
+        var okResult2 = result2.Should().BeOfType<OkObjectResult>().Subject;
+        okResult2.StatusCode.Should().Be(StatusCodes.Status200OK);
+        okResult2.Value?.ToString().Should().Contain("AlreadyMigrated = True");
+
+        _auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentStorage",
+            "Document",
+            doc.Id.ToString(),
+            It.Is<string>(s => s.Contains(newS3Key) && s.Contains(validHash)),
+            "Success",
+            It.IsAny<string?>(),
+            "audit-retry-trace"), Times.Once);
+
+        // Now commit the audit event to DB so it is present for subsequent retries
+        _dbContext.AuditEvents.Add(new AuditEvent
+        {
+            Id = Guid.NewGuid(),
+            SequenceNumber = 2,
+            UserId = ownerId,
+            Action = "MigrateDocumentStorage",
+            EntityType = "Document",
+            EntityId = doc.Id.ToString(),
+            Status = "Success",
+            TimestampUtc = DateTime.UtcNow,
+            PreviousHash = AuditService.GenesisHash,
+            CurrentHash = "dummy-hash-2"
+        });
+        await _dbContext.SaveChangesAsync();
+
+        // Act 3 — Second retry: audit event now exists in DB, must NOT call LogEventAsync again
+        _auditMock.Reset();
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MemoryStream(fileBytes));
+
+        using var stream3 = new MemoryStream(fileBytes);
+        var formFile3 = new FormFile(stream3, 0, fileBytes.Length, "file", "audit_fail.pdf");
+        var result3 = await controller.MigrateLegacyDocument(doc.Id, formFile3, validHash);
+
+        var okResult3 = result3.Should().BeOfType<OkObjectResult>().Subject;
+        okResult3.StatusCode.Should().Be(StatusCodes.Status200OK);
+        okResult3.Value?.ToString().Should().Contain("AlreadyMigrated = True");
+
+        _auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentStorage",
+            It.IsAny<string>(),
+            It.IsAny<string?>(),
+            It.IsAny<string?>(),
+            It.IsAny<string>(),
+            It.IsAny<string?>(),
+            It.IsAny<string?>()), Times.Never, "subsequent retry must NOT duplicate the audit event");
+    }
+
+    [Fact]
+    public async Task MigrateLegacyDocument_ConcurrentRequests_ForSameDocument_SerializesCorrectly_AndDoesNotDuplicateAuditOrOverwriteStorage()
+    {
+        // Arrange
+        var dbName = "RemoteStorageTest_Concurrent_" + Guid.NewGuid().ToString("N");
+        var dbOptions = new DbContextOptionsBuilder<ApplicationDbContext>()
+            .UseInMemoryDatabase(databaseName: dbName)
+            .Options;
+
+        var ownerId = Guid.NewGuid();
+        var legacyKey = "legacy-concurrent-doc.vault";
+        var fileBytes = new byte[] { 10, 20, 30, 40, 50 };
+        var validHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(fileBytes)).ToLowerInvariant();
+
+        var doc = new Document
+        {
+            Id = Guid.NewGuid(),
+            Title = "Concurrent Doc",
+            FileName = "concurrent.pdf",
+            ContentType = "application/pdf",
+            StorageKey = legacyKey,
+            FileSizeBytes = fileBytes.Length,
+            OwnerId = ownerId,
+            IsDeleted = false
+        };
+
+        using (var seedContext = new ApplicationDbContext(dbOptions))
+        {
+            seedContext.Documents.Add(doc);
+            await seedContext.SaveChangesAsync();
+        }
+
+        var newS3Key = $"vault-docs/{Guid.NewGuid():N}.vault";
+        var storageMock = new Mock<IDocumentStorageService>();
+
+        // Delay SaveDocumentAsync by 50ms so that the second request attempts to acquire the lock during migration
+        storageMock.Setup(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "concurrent.pdf", "application/pdf", It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                await Task.Delay(50);
+                return newS3Key;
+            });
+
+        storageMock.Setup(s => s.GetDocumentStreamAsync(newS3Key, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new MemoryStream(fileBytes));
+
+        var auditMock = new Mock<IAuditService>();
+        // Write audit event to shared DB on successful MigrateDocumentStorage
+        auditMock.Setup(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentStorage",
+            "Document",
+            doc.Id.ToString(),
+            It.IsAny<string?>(),
+            "Success",
+            It.IsAny<string?>(),
+            It.IsAny<string?>()))
+            .Returns<Guid?, string, string, string?, string?, string, string?, string?>(async (uid, action, entityType, entityId, details, status, ip, corrId) =>
+            {
+                using var auditCtx = new ApplicationDbContext(dbOptions);
+                var evt = new AuditEvent
+                {
+                    Id = Guid.NewGuid(),
+                    SequenceNumber = 1,
+                    UserId = uid,
+                    Action = action,
+                    EntityType = entityType,
+                    EntityId = entityId,
+                    Details = details,
+                    Status = status,
+                    TimestampUtc = DateTime.UtcNow,
+                    PreviousHash = AuditService.GenesisHash,
+                    CurrentHash = "concurrent-audit-hash"
+                };
+                auditCtx.AuditEvents.Add(evt);
+                await auditCtx.SaveChangesAsync();
+                return evt;
+            });
+
+        var authServiceMock = new Mock<IAuthorizationService>();
+
+        using var dbContext1 = new ApplicationDbContext(dbOptions);
+        using var dbContext2 = new ApplicationDbContext(dbOptions);
+
+        var controller1 = new DocumentsController(
+            dbContext1,
+            authServiceMock.Object,
+            storageMock.Object,
+            auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var controller2 = new DocumentsController(
+            dbContext2,
+            authServiceMock.Object,
+            storageMock.Object,
+            auditMock.Object,
+            _userManagerMock.Object,
+            new CreateDocumentValidator(),
+            new GrantPermissionValidator(),
+            new UpdateDocumentValidator());
+
+        var ownerClaims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, ownerId.ToString()),
+            new(ClaimTypes.Role, Roles.Owner)
+        };
+
+        controller1.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "req-1-trace"
+            }
+        };
+
+        controller2.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext
+            {
+                User = new ClaimsPrincipal(new ClaimsIdentity(ownerClaims, "Bearer")),
+                TraceIdentifier = "req-2-trace"
+            }
+        };
+
+        using var stream1 = new MemoryStream(fileBytes);
+        var formFile1 = new FormFile(stream1, 0, fileBytes.Length, "file", "concurrent.pdf");
+
+        using var stream2 = new MemoryStream(fileBytes);
+        var formFile2 = new FormFile(stream2, 0, fileBytes.Length, "file", "concurrent.pdf");
+
+        // Act — Execute both requests concurrently
+        var task1 = controller1.MigrateLegacyDocument(doc.Id, formFile1, validHash);
+        var task2 = controller2.MigrateLegacyDocument(doc.Id, formFile2, validHash);
+
+        var results = await Task.WhenAll(task1, task2);
+
+        // Assert — Both requests succeed with 200 OK
+        results[0].Should().BeOfType<OkObjectResult>();
+        results[1].Should().BeOfType<OkObjectResult>();
+
+        var ok1 = (OkObjectResult)results[0];
+        var ok2 = (OkObjectResult)results[1];
+        ok1.StatusCode.Should().Be(StatusCodes.Status200OK);
+        ok2.StatusCode.Should().Be(StatusCodes.Status200OK);
+
+        var resultTexts = new[] { ok1.Value?.ToString() ?? "", ok2.Value?.ToString() ?? "" };
+        resultTexts.Should().Contain(s => s.Contains("Migrated = True"));
+        resultTexts.Should().Contain(s => s.Contains("AlreadyMigrated = True"));
+
+        // Assert 1: The stored object was saved exactly ONCE (never overwritten)
+        storageMock.Verify(s => s.SaveDocumentAsync(It.IsAny<Stream>(), "concurrent.pdf", "application/pdf", It.IsAny<CancellationToken>()), Times.Once);
+
+        // Assert 2: Final document storage key in database is correct
+        using (var verifyCtx = new ApplicationDbContext(dbOptions))
+        {
+            var finalDoc = await verifyCtx.Documents.AsNoTracking().FirstAsync(d => d.Id == doc.Id);
+            finalDoc.StorageKey.Should().Be(newS3Key);
+
+            // Assert 3: Only one successful migration audit event exists in the database
+            var auditCount = await verifyCtx.AuditEvents.CountAsync(a =>
+                a.EntityId == doc.Id.ToString() &&
+                a.Action == "MigrateDocumentStorage" &&
+                a.Status == "Success");
+            auditCount.Should().Be(1);
+        }
+
+        // Assert 4: Audit service was invoked exactly once for MigrateDocumentStorage
+        auditMock.Verify(a => a.LogEventAsync(
+            ownerId,
+            "MigrateDocumentStorage",
+            "Document",
+            doc.Id.ToString(),
+            It.IsAny<string?>(),
+            "Success",
+            It.IsAny<string?>(),
+            It.IsAny<string?>()), Times.Once);
+    }
+
     private class FlakyTestDbContext : ApplicationDbContext
     {
         public bool DisableFailure { get; set; }
